@@ -24,19 +24,22 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let args = &argv[1..];
+    // `--mamba-pull` is Mamba's own flag, not cargo's — strip it here, once, so it can
+    // never reach a real cargo invocation, local or remote.
+    let cli_pull = argv[1..].iter().any(|a| a == "--mamba-pull");
+    let args: Vec<String> = argv[1..].iter().filter(|a| a.as_str() != "--mamba-pull").cloned().collect();
 
     // Only `build` goes remote. Everything else is cargo's business.
     if args.first().map(String::as_str) != Some("build") {
-        return exec_real_cargo(args);
+        return exec_real_cargo(&args);
     }
 
     let Ok(cwd) = std::env::current_dir() else {
-        return exec_real_cargo(args);
+        return exec_real_cargo(&args);
     };
 
     let config = match Config::discover(&cwd) {
-        None => return exec_real_cargo(args),
+        None => return exec_real_cargo(&args),
         Some(Err(e)) => {
             eprintln!("mamba: {e}");
             return ExitCode::from(1);
@@ -45,14 +48,23 @@ fn main() -> ExitCode {
     };
 
     if let Err(e) = remote::sync(&config) {
-        return offer_local_build(&config, args, &e);
+        return offer_local_build(&config, &args, &e);
     }
 
     let flags: Vec<Quoted> = args[1..].iter().map(|a| Quoted::new(a)).collect();
 
-    match remote::build(&config, &flags) {
+    let outcome = remote::build(&config, &flags);
+
+    if matches!(outcome, BuildOutcome::Finished(0)) && (cli_pull || config.pull) {
+        match remote::pull(&config, &args[1..]) {
+            Ok(path) => eprintln!("mamba: pulled {}", path.display()),
+            Err(e) => eprintln!("mamba: pull failed: {e}"),
+        }
+    }
+
+    match outcome {
         BuildOutcome::Finished(code) => ExitCode::from(code.clamp(0, 255) as u8),
-        BuildOutcome::Unreachable(why) => offer_local_build(&config, args, &why),
+        BuildOutcome::Unreachable(why) => offer_local_build(&config, &args, &why),
     }
 }
 

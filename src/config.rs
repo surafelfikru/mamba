@@ -77,6 +77,7 @@ pub struct Config {
     pub root: ProjectRoot,
     pub host: Host,
     pub remote_dir: RemoteDir,
+    pub pull: bool,
 }
 
 impl Config {
@@ -110,7 +111,12 @@ impl Config {
             None => default_remote_dir(&root)?,
         };
 
-        Ok(Config { root, host, remote_dir })
+        let pull = match table.get("pull") {
+            None => false,
+            Some(v) => v.as_bool().ok_or_else(|| ConfigError::BadPull(format!("{v:?}")))?,
+        };
+
+        Ok(Config { root, host, remote_dir, pull })
     }
 }
 
@@ -132,6 +138,7 @@ pub enum ConfigError {
     MissingHost,
     BadHost(String),
     BadRemoteDir(String),
+    BadPull(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -146,6 +153,7 @@ impl fmt::Display for ConfigError {
                 write!(f, "host {h:?} is not a plain ssh destination (letters, digits, . - _ @ only)")
             }
             ConfigError::BadRemoteDir(d) => write!(f, "remote_dir {d:?} is empty or contains a quote"),
+            ConfigError::BadPull(v) => write!(f, "pull must be true or false, got {v}"),
         }
     }
 }
@@ -262,6 +270,44 @@ mod tests {
     fn host_of_the_wrong_type_is_an_error() {
         let dir = tmpdir("host-int");
         fs::write(dir.join(CONFIG_FILE), "host = 42\n").unwrap();
+        assert!(Config::discover(&dir).unwrap().is_err());
+    }
+
+    #[test]
+    fn pull_defaults_to_false_when_absent() {
+        let dir = tmpdir("pull-absent");
+        fs::write(dir.join(CONFIG_FILE), "host = \"gpu-box\"\n").unwrap();
+
+        let config = Config::discover(&dir).unwrap().unwrap();
+
+        assert!(!config.pull);
+    }
+
+    #[test]
+    fn explicit_pull_true_is_honoured() {
+        let dir = tmpdir("pull-true");
+        fs::write(dir.join(CONFIG_FILE), "host = \"gpu-box\"\npull = true\n").unwrap();
+
+        let config = Config::discover(&dir).unwrap().unwrap();
+
+        assert!(config.pull);
+    }
+
+    #[test]
+    fn explicit_pull_false_is_honoured() {
+        let dir = tmpdir("pull-false");
+        fs::write(dir.join(CONFIG_FILE), "host = \"gpu-box\"\npull = false\n").unwrap();
+
+        let config = Config::discover(&dir).unwrap().unwrap();
+
+        assert!(!config.pull);
+    }
+
+    #[test]
+    fn pull_of_the_wrong_type_is_an_error() {
+        let dir = tmpdir("pull-string");
+        fs::write(dir.join(CONFIG_FILE), "host = \"gpu-box\"\npull = \"yes\"\n").unwrap();
+
         assert!(Config::discover(&dir).unwrap().is_err());
     }
 }
