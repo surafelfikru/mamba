@@ -47,17 +47,31 @@ fn main() -> ExitCode {
         Some(Ok(config)) => config,
     };
 
+    let project = project_name(&config);
+
+    status("Syncing", &format!("{project} to {}", config.host.as_str()));
     if let Err(e) = remote::sync(&config) {
         return offer_local_build(&config, &args, &e);
     }
 
     let flags: Vec<Quoted> = args[1..].iter().map(|a| Quoted::new(a)).collect();
 
+    // Remote cargo's own "Compiling"/"Finished" lines stream in right after this,
+    // over the ssh child's inherited stdio — so the sync line above and the pull
+    // line below read as one continuous build log, not three separate tools.
     let outcome = remote::build(&config, &flags);
 
     if matches!(outcome, BuildOutcome::Finished(0)) && (cli_pull || config.pull) {
+        status("Downloading", &format!("{project} from {}", config.host.as_str()));
+        let started = std::time::Instant::now();
         match remote::pull(&config, &args[1..]) {
-            Ok(path) => eprintln!("mamba: pulled {}", path.display()),
+            Ok(path) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                status(
+                    "Downloaded",
+                    &format!("{} ({}) in {:.2}s", path.display(), human_size(size), started.elapsed().as_secs_f64()),
+                );
+            }
             Err(e) => eprintln!("mamba: pull failed: {e}"),
         }
     }
@@ -117,6 +131,46 @@ fn exec_real_cargo(args: &[String]) -> ExitCode {
     let error = Command::new(cargo).args(args).exec();
     eprintln!("mamba: could not start cargo: {error}");
     ExitCode::from(126)
+}
+
+/// Prints a status line in cargo's own convention — a bold green verb right-aligned to
+/// 12 columns, then the message — so Mamba's own steps (syncing, downloading) read as
+/// part of the same build log as cargo's "Compiling"/"Finished" lines instead of a
+/// different tool bolted on. Colour is skipped when stderr isn't a terminal, the same
+/// call real cargo makes for its own output.
+fn status(verb: &str, message: &str) {
+    if io::stderr().is_terminal() {
+        eprintln!("\x1b[1m\x1b[92m{verb:>12}\x1b[0m {message}");
+    } else {
+        eprintln!("{verb:>12} {message}");
+    }
+}
+
+/// The project directory's name, used only to label status lines — falls back to
+/// "project" on the off chance the path has no final component.
+fn project_name(config: &Config) -> &str {
+    config
+        .root
+        .as_path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+}
+
+/// Renders a byte count the way a human reads it, e.g. `4.16 MB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.2} {}", UNITS[unit])
+    }
 }
 
 /// Explains how to install the shim, shown when the binary is run as `mamba`.
@@ -255,5 +309,18 @@ mod tests {
         assert!(answer_means_yes("y"));
         assert!(answer_means_yes("yes"));
         assert!(answer_means_yes("sure"));
+    }
+
+    #[test]
+    fn human_size_stays_in_bytes_under_a_kilobyte() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+    }
+
+    #[test]
+    fn human_size_picks_the_largest_unit_that_keeps_it_readable() {
+        assert_eq!(human_size(1024), "1.00 KB");
+        assert_eq!(human_size(4_362_824), "4.16 MB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.00 GB");
     }
 }
