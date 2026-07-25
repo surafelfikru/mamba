@@ -1,11 +1,129 @@
 mod config;
 mod remote;
 
+use config::Config;
+use remote::{BuildOutcome, Quoted};
 use std::ffi::OsStr;
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
-fn main() {
-    println!("Hello, world!");
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().collect();
+
+    let invoked_as = argv
+        .first()
+        .map(Path::new)
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if invoked_as != "cargo" {
+        print_usage();
+        return ExitCode::SUCCESS;
+    }
+
+    let args = &argv[1..];
+
+    // Only `build` goes remote. Everything else is cargo's business.
+    if args.first().map(String::as_str) != Some("build") {
+        return exec_real_cargo(args);
+    }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return exec_real_cargo(args);
+    };
+
+    let config = match Config::discover(&cwd) {
+        None => return exec_real_cargo(args),
+        Some(Err(e)) => {
+            eprintln!("mamba: {e}");
+            return ExitCode::from(1);
+        }
+        Some(Ok(config)) => config,
+    };
+
+    if let Err(e) = remote::sync(&config) {
+        return offer_local_build(&config, args, &e);
+    }
+
+    let flags: Vec<Quoted> = args[1..].iter().map(|a| Quoted::new(a)).collect();
+
+    match remote::build(&config, &flags) {
+        BuildOutcome::Finished(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        BuildOutcome::Unreachable(why) => offer_local_build(&config, args, &why),
+    }
+}
+
+/// Tells the user the remote is down and asks whether to fall back to a local build.
+///
+/// When there is no terminal to ask on — inside `make`, a build script, or an editor's
+/// background check — it falls back without asking, because failing there would break
+/// tooling that has nothing to do with Mamba.
+fn offer_local_build(config: &Config, args: &[String], why: &str) -> ExitCode {
+    eprintln!("mamba: {} unreachable ({why})", config.host.as_str());
+
+    if !io::stdin().is_terminal() {
+        eprintln!("mamba: no terminal to ask on, building locally");
+        return exec_real_cargo(args);
+    }
+
+    eprint!("mamba: build locally instead? [Y/n] ");
+    let _ = io::stderr().flush();
+
+    let mut answer = String::new();
+    match io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => return exec_real_cargo(args),
+        Ok(_) => {}
+    }
+
+    if answer_means_yes(&answer) {
+        exec_real_cargo(args)
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Hands control to the real cargo, replacing this process entirely.
+///
+/// Using `exec` rather than spawning a child means cargo inherits this process's
+/// terminal, signals, and exit status directly — from the caller's point of view the
+/// shim was never there.
+fn exec_real_cargo(args: &[String]) -> ExitCode {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let me = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .unwrap_or_default();
+
+    let Some(cargo) = find_real_cargo(&path_var, &me) else {
+        eprintln!("mamba: no cargo found on PATH besides this shim");
+        return ExitCode::from(127);
+    };
+
+    // Only returns if exec failed.
+    let error = Command::new(cargo).args(args).exec();
+    eprintln!("mamba: could not start cargo: {error}");
+    ExitCode::from(126)
+}
+
+/// Explains how to install the shim, shown when the binary is run as `mamba`.
+fn print_usage() {
+    eprintln!(
+        "\
+mamba builds your Rust project on another machine.
+
+Install the shim, once:
+    ln -s \"$(command -v mamba)\" ~/.local/bin/cargo
+and make sure ~/.local/bin comes before ~/.cargo/bin on your PATH.
+
+Then, in any project you want built remotely, create .mamba.toml:
+    host = \"gpu-box\"            # any ssh destination or ~/.ssh/config alias
+    # remote_dir = \".mamba/proj\"  # optional, relative to the remote home directory
+
+From then on `cargo build` in that project compiles on gpu-box.
+Every other cargo command runs locally as usual."
+    );
 }
 
 /// Finds a `cargo` on `PATH` that is not this executable.
