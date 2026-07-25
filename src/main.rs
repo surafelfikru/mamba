@@ -28,12 +28,10 @@ fn main() -> ExitCode {
 
     // Only `build` goes remote. Everything else is cargo's business.
     if args.first().map(String::as_str) != Some("build") {
-        println!("mamba: not build");
         return exec_real_cargo(args);
     }
 
     let Ok(cwd) = std::env::current_dir() else {
-        println!("mamba: cwd error");
         return exec_real_cargo(args);
     };
 
@@ -93,7 +91,6 @@ fn offer_local_build(config: &Config, args: &[String], why: &str) -> ExitCode {
 /// terminal, signals, and exit status directly — from the caller's point of view the
 /// shim was never there.
 fn exec_real_cargo(args: &[String]) -> ExitCode {
-    println!("mamba: exec_real_cargo");
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     let me = std::env::current_exe()
         .and_then(|p| p.canonicalize())
@@ -105,8 +102,7 @@ fn exec_real_cargo(args: &[String]) -> ExitCode {
     };
 
     // Only returns if exec failed.
-    println!("cargo path: {cargo:?}");
-    let error = Command::new(cargo.clone()).args(args).exec();
+    let error = Command::new(cargo).args(args).exec();
     eprintln!("mamba: could not start cargo: {error}");
     ExitCode::from(126)
 }
@@ -115,7 +111,7 @@ fn exec_real_cargo(args: &[String]) -> ExitCode {
 fn print_usage() {
     eprintln!(
         "\
-Mamba® builds your Rust project on another machine.
+mamba builds your Rust project on another machine.
 
 Install the shim, once:
     ln -s \"$(command -v mamba)\" ~/.local/bin/cargo
