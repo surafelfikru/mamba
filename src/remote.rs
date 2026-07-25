@@ -83,6 +83,61 @@ pub fn sync(config: &Config) -> Result<(), String> {
     }
 }
 
+/// What happened when we tried to build on the remote machine.
+///
+/// The split matters more than it looks. `Finished` means remote cargo ran and this is
+/// its exit status — including a normal compile error, which is a real answer and must
+/// be shown to the user untouched. `Unreachable` means the build never started, and it
+/// is the only case where offering to build locally makes sense. Keeping them as
+/// separate variants makes "retry a compile error locally" unrepresentable.
+#[derive(Debug)]
+pub enum BuildOutcome {
+    Finished(i32),
+    Unreachable(String),
+}
+
+/// Assembles the one-line shell command that ssh will run on the far side.
+///
+/// `CARGO_TERM_COLOR=always` is needed because cargo turns colour off when its output
+/// is not a terminal, and over ssh it never is. Setting it means diagnostics arrive
+/// coloured without allocating a pseudo-terminal.
+pub fn remote_command(dir: &RemoteDir, args: &[Quoted]) -> String {
+    let mut command = format!(
+        "cd {} && CARGO_TERM_COLOR=always cargo build",
+        Quoted::new(dir.as_str()).as_str()
+    );
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg.as_str());
+    }
+    command
+}
+
+/// Runs the build on the remote machine and streams its output straight to this
+/// terminal.
+///
+/// Nothing captures or forwards the output: stdout and stderr are inherited from this
+/// process, so the remote compiler writes to your terminal directly, live, with no
+/// pipe or buffer in between. Exit status 255 is ssh's own signal that it could not
+/// connect, which is why it maps to `Unreachable` while every other status is the
+/// remote cargo's own.
+pub fn build(config: &Config, args: &[Quoted]) -> BuildOutcome {
+    let command = remote_command(&config.remote_dir, args);
+
+    match Command::new("ssh")
+        .arg(config.host.as_str())
+        .arg(&command)
+        .status()
+    {
+        Err(e) => BuildOutcome::Unreachable(format!("could not run ssh: {e}")),
+        Ok(status) => match status.code() {
+            Some(255) => BuildOutcome::Unreachable("ssh could not connect".to_string()),
+            Some(code) => BuildOutcome::Finished(code),
+            None => BuildOutcome::Finished(130),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +294,55 @@ mod tests {
         let config = crate::config::Config::discover(&dir).unwrap().unwrap();
 
         assert!(sync(&config).is_err());
+    }
+
+    #[test]
+    fn remote_command_changes_directory_and_forces_colour() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, &[]);
+
+        assert_eq!(cmd, "cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build");
+    }
+
+    #[test]
+    fn remote_command_appends_every_forwarded_flag_quoted() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let args = [
+            Quoted::new("--release"),
+            Quoted::new("--features"),
+            Quoted::new("a b"),
+        ];
+
+        let cmd = remote_command(&dir, &args);
+
+        assert_eq!(
+            cmd,
+            "cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build '--release' '--features' 'a b'"
+        );
+    }
+
+    #[test]
+    fn remote_command_cannot_be_hijacked_by_a_malicious_flag() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, &[Quoted::new("; rm -rf ~")]);
+
+        // The whole thing stays one quoted argument to cargo.
+        assert!(cmd.ends_with("cargo build '; rm -rf ~'"), "got {cmd}");
+    }
+
+    #[test]
+    fn an_unreachable_host_is_reported_as_unreachable_not_as_a_failed_build() {
+        let dir = tmpdir("ssh-unreachable");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"nonexistent.invalid\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        match build(&config, &[]) {
+            BuildOutcome::Unreachable(_) => {}
+            BuildOutcome::Finished(code) => panic!("expected Unreachable, got Finished({code})"),
+        }
     }
 }
