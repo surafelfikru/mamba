@@ -101,9 +101,18 @@ pub enum BuildOutcome {
 /// `CARGO_TERM_COLOR=always` is needed because cargo turns colour off when its output
 /// is not a terminal, and over ssh it never is. Setting it means diagnostics arrive
 /// coloured without allocating a pseudo-terminal.
+///
+/// The leading `. "$HOME/.cargo/env" 2>/dev/null` matters more than it looks: `ssh host
+/// command` runs a non-interactive remote shell, and rustup's installer normally wires
+/// `~/.cargo/bin` onto `PATH` only from an interactive rc file (`.bashrc`, `.zshrc`).
+/// Without this, a remote `cargo` that a human can run just fine over an interactive
+/// login is invisible here, and fails as `bash: line 1: cargo: command not found` —
+/// indistinguishable at a glance from cargo not being installed at all. Sourcing the
+/// same file rustup itself tells you to source sidesteps that regardless of the
+/// remote's shell or rc setup.
 pub fn remote_command(dir: &RemoteDir, args: &[Quoted]) -> String {
     let mut command = format!(
-        "cd {} && CARGO_TERM_COLOR=always cargo build",
+        ". \"$HOME/.cargo/env\" 2>/dev/null; cd {} && CARGO_TERM_COLOR=always cargo build",
         Quoted::new(dir.as_str()).as_str()
     );
     for arg in args {
@@ -297,11 +306,25 @@ mod tests {
     }
 
     #[test]
+    fn remote_command_sources_cargo_env_before_anything_else() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, &[]);
+
+        assert!(
+            cmd.starts_with(". \"$HOME/.cargo/env\" 2>/dev/null; "),
+            "got {cmd}"
+        );
+    }
+
+    #[test]
     fn remote_command_changes_directory_and_forces_colour() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
         let cmd = remote_command(&dir, &[]);
 
-        assert_eq!(cmd, "cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build");
+        assert_eq!(
+            cmd,
+            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build"
+        );
     }
 
     #[test]
@@ -317,7 +340,7 @@ mod tests {
 
         assert_eq!(
             cmd,
-            "cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build '--release' '--features' 'a b'"
+            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build '--release' '--features' 'a b'"
         );
     }
 
