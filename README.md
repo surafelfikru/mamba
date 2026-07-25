@@ -32,6 +32,11 @@ the build cache.
 
 `rsync` and `ssh` locally, `rsync` and `cargo` on the remote machine.
 
+Cargo needs to work under a plain non-interactive ssh session, i.e.
+`ssh host cargo --version` should print a version. A standard rustup install
+satisfies this on its own — Mamba sources `~/.cargo/env` itself before running
+`cargo build`, so you don't need to touch the remote's `.bashrc`/`.zshrc`.
+
 ### Install
 
 ```sh
