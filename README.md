@@ -55,6 +55,7 @@ Create `.mamba.toml` in any project you want built remotely:
 ```toml
 host = "gpu-box"              # any ssh destination, or an alias from ~/.ssh/config
 remote_dir = ".mamba/myproj"  # optional; relative paths sit in the remote home dir
+pull = false                  # optional; see "Pulling the binary back" below
 ```
 
 That file is the entire opt-in. Projects without one are untouched.
@@ -67,12 +68,39 @@ cargo test               # still local
 Put ports, usernames, keys, and jump hosts in `~/.ssh/config` — `host` accepts an alias
 from it, so Mamba has no separate ssh settings of its own.
 
+### Pulling the binary back
+
+By default nothing comes back — see "Limits worth knowing" below for why. To fetch the
+built binary to the exact local path cargo would have used (`target/debug/yourbin` or
+`target/release/yourbin`), either pass a flag or set it in the config:
+
+```sh
+cargo build --mamba-pull        # this build only
+```
+
+```toml
+pull = true                     # every build in this project
+```
+
+The flag always wins if both are set. It's prefixed `--mamba-pull` rather than `--pull`
+so it can never collide with a real (current or future) cargo flag — Mamba strips it
+before anything reaches cargo, local or remote. Only the crate's default binary (the one
+matching `[package] name` under `src/main.rs`) is resolved; a workspace or an explicit
+`[[bin]]` target under a different name isn't. Pulling only happens after a successful
+build (exit 0) — a compile error leaves nothing on the remote worth fetching, and the
+pull step never changes the build's own exit code, only stderr gets a line either way.
+
+Whether this is worth it depends on the binary's size and the network's latency to your
+host — for reference, a 4.3MB debug binary over a ~120ms-RTT link took about 4 extra
+seconds. On a large binary or a high-latency link that cost adds up fast; measure before
+turning it on by default.
+
 ### Limits worth knowing
 
 Only `cargo build` goes remote. Every other subcommand runs locally, untouched.
 
-Build artifacts stay on the remote machine — `./target/debug/yourbin` will not exist
-locally after a remote build. If you need to run the binary, run it on the remote.
+Build artifacts stay on the remote machine unless you opt into pulling them (above) —
+`./target/debug/yourbin` will not exist locally after a plain remote build.
 
 If the remote is unreachable, Mamba asks whether to build locally instead. With no
 terminal to ask on it falls back automatically and says so. A compile error is never
