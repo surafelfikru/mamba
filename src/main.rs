@@ -60,7 +60,14 @@ fn main() -> ExitCode {
     // Remote cargo's own "Compiling"/"Finished" lines stream in right after this,
     // over the ssh child's inherited stdio — so the sync line above and the pull
     // line below read as one continuous build log, not three separate tools.
-    let outcome = remote::build(&config, &flags);
+    // Splitting runs on the host, using the CPU we are already paying for. It is
+    // skipped silently when the binary name cannot be resolved — a workspace, say —
+    // because a missing optimisation must never fail a build.
+    let post_build = match artifact::binary_name(config.root.as_path()) {
+        Ok(name) => artifact::split_command(artifact::profile_of(&args[1..]), &name),
+        Err(_) => String::new(),
+    };
+    let outcome = remote::build(&config, &flags, &post_build);
 
     if matches!(outcome, BuildOutcome::Finished(0)) && (cli_pull || config.pull) {
         status("Downloading", &format!("{project} from {}", config.host.as_str()));

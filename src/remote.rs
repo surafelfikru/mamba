@@ -110,7 +110,7 @@ pub enum BuildOutcome {
 /// indistinguishable at a glance from cargo not being installed at all. Sourcing the
 /// same file rustup itself tells you to source sidesteps that regardless of the
 /// remote's shell or rc setup.
-pub fn remote_command(dir: &RemoteDir, args: &[Quoted]) -> String {
+pub fn remote_command(dir: &RemoteDir, args: &[Quoted], post_build: &str) -> String {
     let mut command = format!(
         ". \"$HOME/.cargo/env\" 2>/dev/null; cd {} && CARGO_TERM_COLOR=always cargo build",
         Quoted::new(dir.as_str()).as_str()
@@ -118,6 +118,15 @@ pub fn remote_command(dir: &RemoteDir, args: &[Quoted]) -> String {
     for arg in args {
         command.push(' ');
         command.push_str(arg.as_str());
+    }
+
+    // Capture the build's status before anything else runs, and exit with it at the
+    // end. Whatever the post-build step does — including failing outright — the
+    // caller still sees cargo's own verdict.
+    if !post_build.is_empty() {
+        command.push_str(&format!(
+            "; rc=$?; if [ $rc -eq 0 ]; then {post_build}; fi; exit $rc"
+        ));
     }
     command
 }
@@ -130,8 +139,8 @@ pub fn remote_command(dir: &RemoteDir, args: &[Quoted]) -> String {
 /// pipe or buffer in between. Exit status 255 is ssh's own signal that it could not
 /// connect, which is why it maps to `Unreachable` while every other status is the
 /// remote cargo's own.
-pub fn build(config: &Config, args: &[Quoted]) -> BuildOutcome {
-    let command = remote_command(&config.remote_dir, args);
+pub fn build(config: &Config, args: &[Quoted], post_build: &str) -> BuildOutcome {
+    let command = remote_command(&config.remote_dir, args, post_build);
 
     match Command::new("ssh")
         .arg(config.host.as_str())
@@ -306,9 +315,35 @@ mod tests {
     }
 
     #[test]
+    fn remote_command_preserves_the_build_exit_code_across_the_post_build_step() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, &[], "echo split");
+
+        // rc is captured immediately after cargo and re-exited at the end, so a
+        // compile failure stays a compile failure no matter what the split step does.
+        assert!(cmd.contains("rc=$?"), "got {cmd}");
+        assert!(
+            cmd.contains("if [ $rc -eq 0 ]; then echo split; fi"),
+            "got {cmd}"
+        );
+        assert!(cmd.ends_with("exit $rc"), "got {cmd}");
+    }
+
+    #[test]
+    fn remote_command_without_a_post_build_step_is_unchanged() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, &[], "");
+
+        assert_eq!(
+            cmd,
+            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build"
+        );
+    }
+
+    #[test]
     fn remote_command_sources_cargo_env_before_anything_else() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[]);
+        let cmd = remote_command(&dir, &[], "");
 
         assert!(
             cmd.starts_with(". \"$HOME/.cargo/env\" 2>/dev/null; "),
@@ -319,7 +354,7 @@ mod tests {
     #[test]
     fn remote_command_changes_directory_and_forces_colour() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[]);
+        let cmd = remote_command(&dir, &[], "");
 
         assert_eq!(
             cmd,
@@ -336,7 +371,7 @@ mod tests {
             Quoted::new("a b"),
         ];
 
-        let cmd = remote_command(&dir, &args);
+        let cmd = remote_command(&dir, &args, "");
 
         assert_eq!(
             cmd,
@@ -347,7 +382,7 @@ mod tests {
     #[test]
     fn remote_command_cannot_be_hijacked_by_a_malicious_flag() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[Quoted::new("; rm -rf ~")]);
+        let cmd = remote_command(&dir, &[Quoted::new("; rm -rf ~")], "");
 
         // The whole thing stays one quoted argument to cargo.
         assert!(cmd.ends_with("cargo build '; rm -rf ~'"), "got {cmd}");
@@ -363,7 +398,7 @@ mod tests {
         .unwrap();
         let config = crate::config::Config::discover(&dir).unwrap().unwrap();
 
-        match build(&config, &[]) {
+        match build(&config, &[], "") {
             BuildOutcome::Unreachable(_) => {}
             BuildOutcome::Finished(code) => panic!("expected Unreachable, got Finished({code})"),
         }

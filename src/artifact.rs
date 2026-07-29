@@ -9,7 +9,7 @@ use std::process::Command;
 /// package name under `src/main.rs`) — a workspace or an explicit `[[bin]]` target
 /// with a different name isn't handled. Parse `cargo metadata` remotely if that's
 /// ever needed; the common single-binary case doesn't need it.
-fn binary_name(root: &Path) -> Result<String, String> {
+pub(crate) fn binary_name(root: &Path) -> Result<String, String> {
     let path = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
@@ -25,8 +25,30 @@ fn binary_name(root: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("{} has no [package] name", path.display()))
 }
 
+/// The shell fragment the host runs after a successful build to separate debug info
+/// from the binary.
+///
+/// Three steps: copy the symbols into their own file, write a stripped binary
+/// alongside, then record a link from the stripped one back to the symbols. gdb and
+/// `addr2line` follow that link automatically when the two files sit in the same
+/// directory, so a later symbol fetch needs no configuration to take effect.
+///
+/// The trailing `|| cp` matters more than it looks. Without it, a host missing
+/// binutils would leave no `.slim` file and the pull would fail with a confusing
+/// "no such file" — with it, `<bin>.slim` always exists and is simply the unstripped
+/// binary when splitting was not possible.
+pub(crate) fn split_command(profile: &str, name: &str) -> String {
+    let bin = format!("target/{profile}/{name}");
+    format!(
+        "b={bin}; objcopy --only-keep-debug \"$b\" \"$b.debug\" 2>/dev/null \
+         && strip --strip-debug -o \"$b.slim\" \"$b\" 2>/dev/null \
+         && objcopy --add-gnu-debuglink=\"$b.debug\" \"$b.slim\" 2>/dev/null \
+         || cp \"$b\" \"$b.slim\""
+    )
+}
+
 /// Which profile directory cargo will have used, read from the forwarded flags.
-fn profile_of(args: &[String]) -> &'static str {
+pub(crate) fn profile_of(args: &[String]) -> &'static str {
     if args.iter().any(|a| a == "--release") {
         "release"
     } else {
@@ -98,6 +120,59 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mamba-{tag}-{}-{stamp}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn split_command_produces_slim_and_debug_beside_the_binary() {
+        let cmd = split_command("debug", "widget");
+
+        assert!(cmd.contains("target/debug/widget"), "got {cmd}");
+        assert!(cmd.contains("--only-keep-debug"), "got {cmd}");
+        assert!(cmd.contains("--strip-debug"), "got {cmd}");
+        assert!(cmd.contains("--add-gnu-debuglink="), "got {cmd}");
+    }
+
+    #[test]
+    fn split_command_falls_back_to_a_plain_copy_when_binutils_are_missing() {
+        let cmd = split_command("release", "widget");
+
+        // The `|| cp` tail is what guarantees <bin>.slim always exists, so the
+        // puller never has to probe for which name to fetch.
+        assert!(cmd.contains("|| cp "), "got {cmd}");
+    }
+
+    /// The load-bearing test: runs the real fragment against a real binary and checks
+    /// both outputs appear. Reading the man pages is not enough — the argument order
+    /// for --add-gnu-debuglink is easy to get wrong and fails silently.
+    #[test]
+    fn split_command_really_produces_both_files() {
+        let dir = tmpdir("split-real");
+        let bin = dir.join("target/debug/widget");
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        // Any real ELF binary will do; use the test runner itself.
+        fs::copy(std::env::current_exe().unwrap(), &bin).unwrap();
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(split_command("debug", "widget"))
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fragment exited non-zero");
+
+        assert!(
+            dir.join("target/debug/widget.slim").is_file(),
+            "no .slim produced"
+        );
+        assert!(
+            dir.join("target/debug/widget.debug").is_file(),
+            "no .debug produced"
+        );
+        assert!(
+            fs::metadata(dir.join("target/debug/widget.slim")).unwrap().len()
+                < fs::metadata(&bin).unwrap().len(),
+            "slim binary is not smaller than the original"
+        );
     }
 
     #[test]
