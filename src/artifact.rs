@@ -1,0 +1,189 @@
+use crate::config::Config;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Reads the binary name straight from `Cargo.toml`'s `[package] name`.
+///
+/// ponytail: this only resolves the crate's default binary (the one matching the
+/// package name under `src/main.rs`) — a workspace or an explicit `[[bin]]` target
+/// with a different name isn't handled. Parse `cargo metadata` remotely if that's
+/// ever needed; the common single-binary case doesn't need it.
+fn binary_name(root: &Path) -> Result<String, String> {
+    let path = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| format!("{} is not valid TOML: {e}", path.display()))?;
+
+    table
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{} has no [package] name", path.display()))
+}
+
+/// Which profile directory cargo will have used, read from the forwarded flags.
+fn profile_of(args: &[String]) -> &'static str {
+    if args.iter().any(|a| a == "--release") {
+        "release"
+    } else {
+        "debug"
+    }
+}
+
+/// Builds the rsync arguments for pulling the built binary back to the exact local
+/// path cargo would have used, plus that path itself.
+///
+/// Split out from [`pull`] so the profile selection and path arithmetic can be
+/// asserted on directly, without a real host.
+fn pull_args(config: &Config, name: &str, args: &[String]) -> (Vec<OsString>, PathBuf) {
+    let rel = format!("target/{}/{name}", profile_of(args));
+
+    let local = config.root.as_path().join(&rel);
+    let remote = format!(
+        "{}:{}/{rel}",
+        config.host.as_str(),
+        config.remote_dir.as_str()
+    );
+
+    (
+        vec![
+            OsString::from("-az"),
+            OsString::from(remote),
+            local.clone().into_os_string(),
+        ],
+        local,
+    )
+}
+
+/// Copies the built binary back to the exact local path cargo would have used —
+/// `target/debug/<name>` or `target/release/<name>` — so it can be run without ssh'ing
+/// in. Only meaningful after a successful build; a compile failure leaves nothing on
+/// the remote worth pulling.
+pub fn pull(config: &Config, args: &[String]) -> Result<PathBuf, String> {
+    let name = binary_name(config.root.as_path())?;
+    let (rsync_args, local) = pull_args(config, &name, args);
+
+    if let Some(parent) = local.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+
+    match Command::new("rsync").args(&rsync_args).status() {
+        Err(e) => Err(format!("could not run rsync: {e}")),
+        Ok(status) if status.success() => Ok(local),
+        Ok(status) => match status.code() {
+            Some(code) => Err(format!("rsync exited with {code}")),
+            None => Err("rsync was killed by a signal".to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    /// Makes a throwaway directory under the system temp dir. Named with the process
+    /// id and a nanosecond stamp so parallel tests never collide.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mamba-{tag}-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn binary_name_reads_the_package_name_from_cargo_toml() {
+        let dir = tmpdir("binary-name");
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"widget\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(binary_name(&dir).unwrap(), "widget");
+    }
+
+    #[test]
+    fn binary_name_errors_when_cargo_toml_is_missing() {
+        let dir = tmpdir("binary-name-missing");
+        assert!(binary_name(&dir).is_err());
+    }
+
+    #[test]
+    fn pull_args_uses_debug_profile_by_default() {
+        let dir = tmpdir("pull-args-debug");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        let (args, local) = pull_args(&config, "widget", &[]);
+
+        assert!(local.ends_with("target/debug/widget"), "got {local:?}");
+        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(
+            joined.contains(&"gpu-box:.mamba/widget/target/debug/widget".to_string()),
+            "got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn pull_args_uses_release_profile_when_flagged() {
+        let dir = tmpdir("pull-args-release");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        let (_, local) = pull_args(&config, "widget", &["--release".to_string()]);
+
+        assert!(local.ends_with("target/release/widget"), "got {local:?}");
+    }
+
+    /// Confirms the actual transfer, not just the string-building: a genuine rsync run
+    /// (target substituted for a local path, same trick as the sync tests) creates
+    /// missing local directories and lands the file at the exact profile path.
+    #[test]
+    fn pull_copies_the_binary_to_the_exact_local_profile_path() {
+        let base = tmpdir("pull-e2e");
+        let project = base.join("project");
+        let fake_remote_bin = base.join("remote-target/debug/widget");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(fake_remote_bin.parent().unwrap()).unwrap();
+
+        fs::write(
+            project.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"widget\"\n").unwrap();
+        fs::write(&fake_remote_bin, "pretend binary\n").unwrap();
+
+        let config = crate::config::Config::discover(&project).unwrap().unwrap();
+        let (mut args, local) = pull_args(&config, "widget", &[]);
+        args[1] = fake_remote_bin.clone().into_os_string();
+
+        assert!(
+            !local.parent().unwrap().is_dir(),
+            "test setup should start without target/debug"
+        );
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        let status = Command::new("rsync").args(&args).status().unwrap();
+        assert!(status.success());
+
+        assert_eq!(fs::read_to_string(&local).unwrap(), "pretend binary\n");
+    }
+}

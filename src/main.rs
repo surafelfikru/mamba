@@ -1,3 +1,4 @@
+mod artifact;
 mod config;
 mod remote;
 
@@ -64,7 +65,7 @@ fn main() -> ExitCode {
     if matches!(outcome, BuildOutcome::Finished(0)) && (cli_pull || config.pull) {
         status("Downloading", &format!("{project} from {}", config.host.as_str()));
         let started = std::time::Instant::now();
-        match remote::pull(&config, &args[1..]) {
+        match artifact::pull(&config, &args[1..]) {
             Ok(path) => {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 status(
