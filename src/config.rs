@@ -78,6 +78,7 @@ pub struct Config {
     pub host: Host,
     pub remote_dir: RemoteDir,
     pub pull: bool,
+    pub symbols: bool,
 }
 
 impl Config {
@@ -116,7 +117,14 @@ impl Config {
             Some(v) => v.as_bool().ok_or_else(|| ConfigError::BadPull(format!("{v:?}")))?,
         };
 
-        Ok(Config { root, host, remote_dir, pull })
+        let symbols = match table.get("symbols") {
+            None => false,
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| ConfigError::BadSymbols(format!("{v:?}")))?,
+        };
+
+        Ok(Config { root, host, remote_dir, pull, symbols })
     }
 }
 
@@ -139,6 +147,7 @@ pub enum ConfigError {
     BadHost(String),
     BadRemoteDir(String),
     BadPull(String),
+    BadSymbols(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -154,6 +163,7 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::BadRemoteDir(d) => write!(f, "remote_dir {d:?} is empty or contains a quote"),
             ConfigError::BadPull(v) => write!(f, "pull must be true or false, got {v}"),
+            ConfigError::BadSymbols(v) => write!(f, "symbols must be true or false, got {v}"),
         }
     }
 }
@@ -301,6 +311,38 @@ mod tests {
         let config = Config::discover(&dir).unwrap().unwrap();
 
         assert!(!config.pull);
+    }
+
+    #[test]
+    fn symbols_defaults_to_false_when_absent() {
+        let dir = tmpdir("symbols-absent");
+        fs::write(dir.join(CONFIG_FILE), "host = \"gpu-box\"\n").unwrap();
+
+        assert!(!Config::discover(&dir).unwrap().unwrap().symbols);
+    }
+
+    #[test]
+    fn explicit_symbols_true_is_honoured() {
+        let dir = tmpdir("symbols-true");
+        fs::write(
+            dir.join(CONFIG_FILE),
+            "host = \"gpu-box\"\nsymbols = true\n",
+        )
+        .unwrap();
+
+        assert!(Config::discover(&dir).unwrap().unwrap().symbols);
+    }
+
+    #[test]
+    fn symbols_of_the_wrong_type_is_an_error() {
+        let dir = tmpdir("symbols-string");
+        fs::write(
+            dir.join(CONFIG_FILE),
+            "host = \"gpu-box\"\nsymbols = \"yes\"\n",
+        )
+        .unwrap();
+
+        assert!(Config::discover(&dir).unwrap().is_err());
     }
 
     #[test]

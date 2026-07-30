@@ -27,8 +27,13 @@ fn main() -> ExitCode {
 
     // `--mamba-pull` is Mamba's own flag, not cargo's — strip it here, once, so it can
     // never reach a real cargo invocation, local or remote.
-    let cli_pull = argv[1..].iter().any(|a| a == "--mamba-pull");
-    let args: Vec<String> = argv[1..].iter().filter(|a| a.as_str() != "--mamba-pull").cloned().collect();
+    let cli_symbols = argv[1..].iter().any(|a| a == "--mamba-symbols");
+    let cli_pull = argv[1..].iter().any(|a| a == "--mamba-pull") || cli_symbols;
+    let args: Vec<String> = argv[1..]
+        .iter()
+        .filter(|a| a.as_str() != "--mamba-pull" && a.as_str() != "--mamba-symbols")
+        .cloned()
+        .collect();
 
     // Only `build` goes remote. Everything else is cargo's business.
     if args.first().map(String::as_str) != Some("build") {
@@ -81,6 +86,16 @@ fn main() -> ExitCode {
                 );
             }
             Err(e) => eprintln!("mamba: pull failed: {e}"),
+        }
+
+        if cli_symbols || config.symbols {
+            match artifact::pull_symbols(&config, &args[1..]) {
+                Ok(p) => {
+                    let n = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    status("Symbols", &format!("{} ({})", p.display(), human_size(n)));
+                }
+                Err(e) => eprintln!("mamba: symbols unavailable: {e}"),
+            }
         }
     }
 
@@ -196,6 +211,8 @@ Then, in any project you want built remotely, create .mamba.toml:
     # remote_dir = \".mamba/proj\"  # optional, relative to the remote home directory
 
 From then on `cargo build` in that project compiles on gpu-box.
+    cargo build --mamba-pull      fetch the built binary back
+    cargo build --mamba-symbols   also fetch debug symbols for it
 Every other cargo command runs locally as usual."
     );
 }

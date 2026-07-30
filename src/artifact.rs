@@ -107,6 +107,52 @@ pub fn pull(config: &Config, args: &[String]) -> Result<PathBuf, String> {
     }
 }
 
+/// Builds the rsync arguments for fetching the symbol file, plus where it lands.
+fn symbols_args(config: &Config, name: &str, args: &[String]) -> (Vec<OsString>, PathBuf) {
+    let rel = format!("target/{}/{name}.debug", profile_of(args));
+
+    let local = config.root.as_path().join(&rel);
+    let remote = format!(
+        "{}:{}/{rel}",
+        config.host.as_str(),
+        config.remote_dir.as_str()
+    );
+
+    (
+        vec![
+            OsString::from("-az"),
+            OsString::from(remote),
+            local.clone().into_os_string(),
+        ],
+        local,
+    )
+}
+
+/// Fetches the debug symbols for the binary just pulled.
+///
+/// The stripped binary records a link naming this file, and both gdb and `addr2line`
+/// follow it automatically once the two sit side by side — so nothing needs
+/// configuring after this lands. Without it a backtrace still shows function names,
+/// just not line numbers.
+pub fn pull_symbols(config: &Config, args: &[String]) -> Result<PathBuf, String> {
+    let name = binary_name(config.root.as_path())?;
+    let (rsync_args, local) = symbols_args(config, &name, args);
+
+    if let Some(parent) = local.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+
+    match Command::new("rsync").args(&rsync_args).status() {
+        Err(e) => Err(format!("could not run rsync: {e}")),
+        Ok(status) if status.success() => Ok(local),
+        Ok(status) => match status.code() {
+            Some(code) => Err(format!("rsync exited with {code}")),
+            None => Err("rsync was killed by a signal".to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +282,31 @@ mod tests {
         assert!(
             local.ends_with("target/debug/widget"),
             "local side must be the plain name cargo would have written, got {local:?}"
+        );
+    }
+
+    #[test]
+    fn pull_symbols_fetches_the_debug_file_next_to_the_binary() {
+        let dir = tmpdir("pull-symbols");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        let (args, local) = symbols_args(&config, "widget", &[]);
+        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+        assert!(
+            joined.contains(&"gpu-box:.mamba/widget/target/debug/widget.debug".to_string()),
+            "got {joined:?}"
+        );
+        // The debuglink recorded on the host stores a bare filename, so the symbol
+        // file has to sit in the same directory as the binary for gdb to find it.
+        assert!(
+            local.ends_with("target/debug/widget.debug"),
+            "got {local:?}"
         );
     }
 
