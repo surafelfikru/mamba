@@ -153,6 +153,62 @@ pub fn pull_symbols(config: &Config, args: &[String]) -> Result<PathBuf, String>
     }
 }
 
+/// rsync arguments for fetching just the proc-macro dylibs out of the host's `deps/`
+/// directory, plus the local directory they land in.
+fn proc_macro_args(config: &Config, args: &[String]) -> (Vec<OsString>, PathBuf) {
+    let rel = format!("target/{}/deps", profile_of(args));
+
+    let local = config.root.as_path().join(&rel);
+    let remote = format!(
+        "{}:{}/{rel}/",
+        config.host.as_str(),
+        config.remote_dir.as_str()
+    );
+
+    // deps/ is mostly rlibs and rmeta — hundreds of megabytes that are statically
+    // linked into the binary and never needed here. Only the dylibs matter, so the
+    // include comes before the catch-all exclude; rsync takes the first rule that
+    // matches, and reversing these two copies the entire directory.
+    (
+        vec![
+            OsString::from("-az"),
+            OsString::from("--include=*.so"),
+            OsString::from("--exclude=*"),
+            OsString::from(remote),
+            local.clone().into_os_string(),
+        ],
+        local,
+    )
+}
+
+/// Brings the compiled proc-macro libraries down so rust-analyzer can expand derives.
+///
+/// These are the one part of the host's `deps/` directory that has to exist locally:
+/// the editor loads them as dynamic libraries to expand `#[derive(Serialize)]` and
+/// friends, and without them those types read as unresolved. They only change when
+/// dependencies do, so this is cheap to repeat.
+pub fn sync_proc_macros(config: &Config, args: &[String]) -> Result<usize, String> {
+    let (rsync_args, local) = proc_macro_args(config, args);
+
+    std::fs::create_dir_all(&local)
+        .map_err(|e| format!("could not create {}: {e}", local.display()))?;
+
+    match Command::new("rsync").args(&rsync_args).status() {
+        Err(e) => Err(format!("could not run rsync: {e}")),
+        Ok(status) if status.success() => Ok(std::fs::read_dir(&local)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "so"))
+                    .count()
+            })
+            .unwrap_or(0)),
+        Ok(status) => match status.code() {
+            Some(code) => Err(format!("rsync exited with {code}")),
+            None => Err("rsync was killed by a signal".to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +379,70 @@ mod tests {
         let (_, local) = pull_args(&config, "widget", &["--release".to_string()]);
 
         assert!(local.ends_with("target/release/widget"), "got {local:?}");
+    }
+
+    #[test]
+    fn proc_macro_sync_takes_only_shared_objects_from_deps() {
+        let dir = tmpdir("proc-macro-args");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        let (args, local) = proc_macro_args(&config, &[]);
+        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+        assert!(joined.contains(&"--include=*.so".to_string()), "got {joined:?}");
+        assert!(joined.contains(&"--exclude=*".to_string()), "got {joined:?}");
+        assert!(
+            joined.contains(&"gpu-box:.mamba/widget/target/debug/deps/".to_string()),
+            "got {joined:?}"
+        );
+        assert!(local.ends_with("target/debug/deps"), "got {local:?}");
+    }
+
+    /// deps/ holds a gigabyte of rlibs next to a handful of proc-macro dylibs.
+    /// Running the real filters between two local directories is the only way to be
+    /// sure the include/exclude ordering actually excludes the rlibs — get the order
+    /// wrong and it silently copies everything.
+    #[test]
+    fn proc_macro_sync_really_leaves_the_rlibs_behind() {
+        let base = tmpdir("proc-macro-real");
+        let src = base.join("deps");
+        let dst = base.join("local");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("libserde_derive-abc.so"), "dylib").unwrap();
+        fs::write(src.join("libserde-abc.rlib"), "x".repeat(1000)).unwrap();
+        fs::write(src.join("serde-abc.rmeta"), "y".repeat(1000)).unwrap();
+
+        let mut args: Vec<OsString> = vec![
+            OsString::from("-az"),
+            OsString::from("--include=*.so"),
+            OsString::from("--exclude=*"),
+        ];
+        let mut from = src.clone().into_os_string();
+        from.push("/");
+        args.push(from);
+        args.push(dst.clone().into_os_string());
+
+        let status = Command::new("rsync").args(&args).status().unwrap();
+        assert!(status.success());
+
+        assert!(
+            dst.join("libserde_derive-abc.so").is_file(),
+            "dylib was not copied"
+        );
+        assert!(
+            !dst.join("libserde-abc.rlib").exists(),
+            "rlib should not have been copied"
+        );
+        assert!(
+            !dst.join("serde-abc.rmeta").exists(),
+            "rmeta should not have been copied"
+        );
     }
 
     /// Confirms the actual transfer, not just the string-building: a genuine rsync run

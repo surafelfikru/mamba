@@ -97,6 +97,12 @@ fn main() -> ExitCode {
                 Err(e) => eprintln!("mamba: symbols unavailable: {e}"),
             }
         }
+
+        match artifact::sync_proc_macros(&config, &args[1..]) {
+            Ok(0) => {}
+            Ok(n) => status("Macros", &format!("{n} proc-macro libraries")),
+            Err(e) => eprintln!("mamba: proc-macro sync failed: {e}"),
+        }
     }
 
     match outcome {
