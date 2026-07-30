@@ -209,6 +209,59 @@ pub fn sync_proc_macros(config: &Config, args: &[String]) -> Result<usize, Strin
     }
 }
 
+/// rsync arguments for fetching build-script generated Rust source, plus the local
+/// directory it lands in.
+fn generated_source_args(config: &Config, args: &[String]) -> (Vec<OsString>, PathBuf) {
+    let rel = format!("target/{}/build", profile_of(args));
+
+    let local = config.root.as_path().join(&rel);
+    let remote = format!(
+        "{}:{}/{rel}/",
+        config.host.as_str(),
+        config.remote_dir.as_str()
+    );
+
+    // Three rules in a deliberate order: descend into every directory, take the .rs
+    // files found there, drop everything else. Without the first rule rsync never
+    // enters the nested <pkg>-<hash>/out/ directories and copies nothing at all.
+    // --prune-empty-dirs then keeps the local tree from filling with empty shells
+    // for the many packages that generate no source.
+    (
+        vec![
+            OsString::from("-az"),
+            OsString::from("--include=*/"),
+            OsString::from("--include=*.rs"),
+            OsString::from("--exclude=*"),
+            OsString::from("--prune-empty-dirs"),
+            OsString::from(remote),
+            local.clone().into_os_string(),
+        ],
+        local,
+    )
+}
+
+/// Brings down the Rust source that build scripts generate, so the editor can resolve
+/// types defined by `include!(concat!(env!("OUT_DIR"), ...))`.
+///
+/// Only `.rs` files travel. The compiled build-script executables sharing that
+/// directory are the bulk of its size and are never needed locally, which is what
+/// keeps this cheap even though the directory it draws from is large.
+pub fn sync_generated_source(config: &Config, args: &[String]) -> Result<(), String> {
+    let (rsync_args, local) = generated_source_args(config, args);
+
+    std::fs::create_dir_all(&local)
+        .map_err(|e| format!("could not create {}: {e}", local.display()))?;
+
+    match Command::new("rsync").args(&rsync_args).status() {
+        Err(e) => Err(format!("could not run rsync: {e}")),
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => match status.code() {
+            Some(code) => Err(format!("rsync exited with {code}")),
+            None => Err("rsync was killed by a signal".to_string()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +496,74 @@ mod tests {
             !dst.join("serde-abc.rmeta").exists(),
             "rmeta should not have been copied"
         );
+    }
+
+    /// build/ is ~190 MB for a real project, nearly all of it compiled build-script
+    /// executables. Only the generated .rs files are wanted, and they are nested
+    /// under <pkg>-<hash>/out/. This runs the real filters because the recursive
+    /// include of directories is easy to omit, which silently copies nothing.
+    #[test]
+    fn generated_source_sync_takes_rs_files_and_skips_build_script_binaries() {
+        let base = tmpdir("outdir-real");
+        let src = base.join("build");
+        let dst = base.join("local");
+        fs::create_dir_all(src.join("proto-abc123/out")).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("proto-abc123/out/api.rs"), "pub struct Req;").unwrap();
+        fs::write(src.join("proto-abc123/build-script-build"), "x".repeat(5000)).unwrap();
+        fs::write(src.join("proto-abc123/out/schema.bin"), "y".repeat(5000)).unwrap();
+
+        let mut args: Vec<OsString> = vec![
+            OsString::from("-az"),
+            OsString::from("--include=*/"),
+            OsString::from("--include=*.rs"),
+            OsString::from("--exclude=*"),
+            OsString::from("--prune-empty-dirs"),
+        ];
+        let mut from = src.clone().into_os_string();
+        from.push("/");
+        args.push(from);
+        args.push(dst.clone().into_os_string());
+
+        let status = Command::new("rsync").args(&args).status().unwrap();
+        assert!(status.success());
+
+        assert!(
+            dst.join("proto-abc123/out/api.rs").is_file(),
+            "generated source missing"
+        );
+        assert!(
+            !dst.join("proto-abc123/build-script-build").exists(),
+            "build script binary should not have been copied"
+        );
+        assert!(
+            !dst.join("proto-abc123/out/schema.bin").exists(),
+            "non-Rust asset should not have been copied"
+        );
+    }
+
+    #[test]
+    fn generated_source_args_point_at_the_build_directory() {
+        let dir = tmpdir("outdir-args");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        let (args, local) = generated_source_args(&config, &["--release".to_string()]);
+        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+        assert!(
+            joined.contains(&"--prune-empty-dirs".to_string()),
+            "got {joined:?}"
+        );
+        assert!(
+            joined.contains(&"gpu-box:.mamba/widget/target/release/build/".to_string()),
+            "got {joined:?}"
+        );
+        assert!(local.ends_with("target/release/build"), "got {local:?}");
     }
 
     /// Confirms the actual transfer, not just the string-building: a genuine rsync run

@@ -55,7 +55,8 @@ Create `.mamba.toml` in any project you want built remotely:
 ```toml
 host = "gpu-box"              # any ssh destination, or an alias from ~/.ssh/config
 remote_dir = ".mamba/myproj"  # optional; relative paths sit in the remote home dir
-pull = false                  # optional; see "Pulling the binary back" below
+pull = false                  # optional; fetch the built binary after a successful build
+symbols = false               # optional; also fetch its debug symbols
 ```
 
 That file is the entire opt-in. Projects without one are untouched.
@@ -76,10 +77,12 @@ built binary to the exact local path cargo would have used (`target/debug/yourbi
 
 ```sh
 cargo build --mamba-pull        # this build only
+cargo build --mamba-symbols     # also fetch debug symbols (implies --mamba-pull)
 ```
 
 ```toml
 pull = true                     # every build in this project
+symbols = true                  # and always fetch symbols too
 ```
 
 The flag always wins if both are set. It's prefixed `--mamba-pull` rather than `--pull`
@@ -101,6 +104,11 @@ Only `cargo build` goes remote. Every other subcommand runs locally, untouched.
 
 Build artifacts stay on the remote machine unless you opt into pulling them (above) —
 `./target/debug/yourbin` will not exist locally after a plain remote build.
+
+The binary you get is stripped of debug info, which makes it roughly four times
+smaller to transfer. Panic backtraces still show function names. For line numbers
+and source-level debugging, add `--mamba-symbols` to fetch the symbol file — your
+debugger picks it up automatically once it is there.
 
 If the remote is unreachable, Mamba asks whether to build locally instead. With no
 terminal to ask on it falls back automatically and says so. A compile error is never

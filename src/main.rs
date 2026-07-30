@@ -103,6 +103,10 @@ fn main() -> ExitCode {
             Ok(n) => status("Macros", &format!("{n} proc-macro libraries")),
             Err(e) => eprintln!("mamba: proc-macro sync failed: {e}"),
         }
+
+        if let Err(e) = artifact::sync_generated_source(&config, &args[1..]) {
+            eprintln!("mamba: generated-source sync failed: {e}");
+        }
     }
 
     match outcome {
