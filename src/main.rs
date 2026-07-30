@@ -69,7 +69,7 @@ fn main() -> ExitCode {
     // skipped silently when the binary name cannot be resolved — a workspace, say —
     // because a missing optimisation must never fail a build.
     let post_build = match artifact::binary_name(config.root.as_path()) {
-        Ok(name) => artifact::split_command(artifact::profile_of(&args[1..]), &name),
+        Ok(name) => artifact::split_command(&artifact::target_subdir(&args[1..]), &name),
         Err(_) => String::new(),
     };
     let outcome = remote::build(&config, &flags, &post_build);
@@ -98,6 +98,14 @@ fn main() -> ExitCode {
             }
         }
 
+    }
+
+    // Editor support is not tied to wanting the binary. rust-analyzer needs the
+    // proc-macro libraries to expand derives and the generated sources to resolve
+    // anything a build script produced, whether or not the developer asked for the
+    // executable — so these run on every successful build, including the common
+    // `pull = false` case where nothing else comes home.
+    if matches!(outcome, BuildOutcome::Finished(0)) {
         match artifact::sync_proc_macros(&config, &args[1..]) {
             Ok(0) => {}
             Ok(n) => status("Macros", &format!("{n} proc-macro libraries")),

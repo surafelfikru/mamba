@@ -5,7 +5,7 @@ use std::process::Command;
 
 /// Reads the binary name straight from `Cargo.toml`'s `[package] name`.
 ///
-/// ponytail: this only resolves the crate's default binary (the one matching the
+/// this only resolves the crate's default binary (the one matching the
 /// package name under `src/main.rs`) — a workspace or an explicit `[[bin]]` target
 /// with a different name isn't handled. Parse `cargo metadata` remotely if that's
 /// ever needed; the common single-binary case doesn't need it.
@@ -37,8 +37,8 @@ pub(crate) fn binary_name(root: &Path) -> Result<String, String> {
 /// binutils would leave no `.slim` file and the pull would fail with a confusing
 /// "no such file" — with it, `<bin>.slim` always exists and is simply the unstripped
 /// binary when splitting was not possible.
-pub(crate) fn split_command(profile: &str, name: &str) -> String {
-    let bin = format!("target/{profile}/{name}");
+pub(crate) fn split_command(subdir: &str, name: &str) -> String {
+    let bin = format!("target/{subdir}/{name}");
     format!(
         "b={bin}; objcopy --only-keep-debug \"$b\" \"$b.debug\" 2>/dev/null \
          && strip --strip-debug -o \"$b.slim\" \"$b\" 2>/dev/null \
@@ -47,12 +47,50 @@ pub(crate) fn split_command(profile: &str, name: &str) -> String {
     )
 }
 
-/// Which profile directory cargo will have used, read from the forwarded flags.
-pub(crate) fn profile_of(args: &[String]) -> &'static str {
+/// Reads the value of a flag written either as `--flag value` or `--flag=value`.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == flag {
+            return rest.next().map(String::as_str);
+        }
+        if let Some(value) = arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The profile directory cargo writes into, which is not always the profile's name.
+///
+/// `dev` and `test` both build into `debug`, and `bench` into `release`; every other
+/// name — including a custom profile declared in `Cargo.toml` — uses itself.
+fn profile_directory(args: &[String]) -> &str {
+    if let Some(name) = flag_value(args, "--profile") {
+        return match name {
+            "dev" | "test" => "debug",
+            "bench" => "release",
+            other => other,
+        };
+    }
     if args.iter().any(|a| a == "--release") {
         "release"
     } else {
         "debug"
+    }
+}
+
+/// Where under `target/` this build's artifacts land, as a relative path.
+///
+/// Three things move it and all three have to be read from the same flags the remote
+/// build received, or Mamba looks for a binary cargo never wrote there: `--release`,
+/// `--profile <name>`, and `--target <triple>` — the last nesting everything one level
+/// deeper. Returns for example `debug`, `quick`, or `aarch64-unknown-linux-gnu/release`.
+pub(crate) fn target_subdir(args: &[String]) -> String {
+    let profile = profile_directory(args);
+    match flag_value(args, "--target") {
+        Some(triple) => format!("{triple}/{profile}"),
+        None => profile.to_string(),
     }
 }
 
@@ -62,7 +100,7 @@ pub(crate) fn profile_of(args: &[String]) -> &'static str {
 /// Split out from [`pull`] so the profile selection and path arithmetic can be
 /// asserted on directly, without a real host.
 fn pull_args(config: &Config, name: &str, args: &[String]) -> (Vec<OsString>, PathBuf) {
-    let rel = format!("target/{}/{name}", profile_of(args));
+    let rel = format!("target/{}/{name}", target_subdir(args));
 
     // The host holds both a full binary and a stripped one. Only the stripped one
     // travels, but it lands under the plain name so everything downstream — running
@@ -109,7 +147,7 @@ pub fn pull(config: &Config, args: &[String]) -> Result<PathBuf, String> {
 
 /// Builds the rsync arguments for fetching the symbol file, plus where it lands.
 fn symbols_args(config: &Config, name: &str, args: &[String]) -> (Vec<OsString>, PathBuf) {
-    let rel = format!("target/{}/{name}.debug", profile_of(args));
+    let rel = format!("target/{}/{name}.debug", target_subdir(args));
 
     let local = config.root.as_path().join(&rel);
     let remote = format!(
@@ -156,7 +194,7 @@ pub fn pull_symbols(config: &Config, args: &[String]) -> Result<PathBuf, String>
 /// rsync arguments for fetching just the proc-macro dylibs out of the host's `deps/`
 /// directory, plus the local directory they land in.
 fn proc_macro_args(config: &Config, args: &[String]) -> (Vec<OsString>, PathBuf) {
-    let rel = format!("target/{}/deps", profile_of(args));
+    let rel = format!("target/{}/deps", target_subdir(args));
 
     let local = config.root.as_path().join(&rel);
     let remote = format!(
@@ -212,7 +250,7 @@ pub fn sync_proc_macros(config: &Config, args: &[String]) -> Result<usize, Strin
 /// rsync arguments for fetching build-script generated Rust source, plus the local
 /// directory it lands in.
 fn generated_source_args(config: &Config, args: &[String]) -> (Vec<OsString>, PathBuf) {
-    let rel = format!("target/{}/build", profile_of(args));
+    let rel = format!("target/{}/build", target_subdir(args));
 
     let local = config.root.as_path().join(&rel);
     let remote = format!(
@@ -280,6 +318,63 @@ mod tests {
         dir
     }
 
+    fn subdir(flags: &[&str]) -> String {
+        let owned: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+        target_subdir(&owned)
+    }
+
+    #[test]
+    fn plain_build_lands_in_debug() {
+        assert_eq!(subdir(&[]), "debug");
+    }
+
+    #[test]
+    fn release_flag_lands_in_release() {
+        assert_eq!(subdir(&["--release"]), "release");
+    }
+
+    /// `--profile <name>` writes to a directory named after the profile, so a custom
+    /// profile from Cargo.toml gets its own. Verified against real cargo.
+    #[test]
+    fn custom_profile_gets_its_own_directory() {
+        assert_eq!(subdir(&["--profile", "quick"]), "quick");
+    }
+
+    /// The built-in profiles are the trap: their directory is not their name.
+    #[test]
+    fn built_in_profile_names_map_to_their_real_directories() {
+        assert_eq!(subdir(&["--profile", "dev"]), "debug");
+        assert_eq!(subdir(&["--profile", "test"]), "debug");
+        assert_eq!(subdir(&["--profile", "bench"]), "release");
+        assert_eq!(subdir(&["--profile", "release"]), "release");
+    }
+
+    #[test]
+    fn the_equals_form_of_a_flag_is_understood_too() {
+        assert_eq!(subdir(&["--profile=release"]), "release");
+        assert_eq!(subdir(&["--target=x86_64-unknown-linux-gnu"]), "x86_64-unknown-linux-gnu/debug");
+    }
+
+    /// Cross-compiling nests everything one level deeper under the target triple.
+    #[test]
+    fn a_target_triple_nests_the_profile_directory() {
+        assert_eq!(
+            subdir(&["--target", "x86_64-unknown-linux-gnu"]),
+            "x86_64-unknown-linux-gnu/debug"
+        );
+        assert_eq!(
+            subdir(&["--target", "aarch64-unknown-linux-gnu", "--release"]),
+            "aarch64-unknown-linux-gnu/release"
+        );
+    }
+
+    /// A flag that merely mentions the word must not be mistaken for the flag itself.
+    #[test]
+    fn a_trailing_flag_with_no_value_does_not_panic() {
+        assert_eq!(subdir(&["--profile"]), "debug");
+        assert_eq!(subdir(&["--target"]), "debug");
+    }
+
     #[test]
     fn split_command_produces_slim_and_debug_beside_the_binary() {
         let cmd = split_command("debug", "widget");
@@ -327,7 +422,9 @@ mod tests {
             "no .debug produced"
         );
         assert!(
-            fs::metadata(dir.join("target/debug/widget.slim")).unwrap().len()
+            fs::metadata(dir.join("target/debug/widget.slim"))
+                .unwrap()
+                .len()
                 < fs::metadata(&bin).unwrap().len(),
             "slim binary is not smaller than the original"
         );
@@ -364,7 +461,10 @@ mod tests {
         let (args, local) = pull_args(&config, "widget", &[]);
 
         assert!(local.ends_with("target/debug/widget"), "got {local:?}");
-        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert!(
             joined.contains(&"gpu-box:.mamba/widget/target/debug/widget.slim".to_string()),
             "got {joined:?}"
@@ -382,7 +482,10 @@ mod tests {
         let config = crate::config::Config::discover(&dir).unwrap().unwrap();
 
         let (args, local) = pull_args(&config, "widget", &[]);
-        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
 
         assert!(
             joined.contains(&"gpu-box:.mamba/widget/target/debug/widget.slim".to_string()),
@@ -405,7 +508,10 @@ mod tests {
         let config = crate::config::Config::discover(&dir).unwrap().unwrap();
 
         let (args, local) = symbols_args(&config, "widget", &[]);
-        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
 
         assert!(
             joined.contains(&"gpu-box:.mamba/widget/target/debug/widget.debug".to_string()),
@@ -445,10 +551,19 @@ mod tests {
         let config = crate::config::Config::discover(&dir).unwrap().unwrap();
 
         let (args, local) = proc_macro_args(&config, &[]);
-        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
 
-        assert!(joined.contains(&"--include=*.so".to_string()), "got {joined:?}");
-        assert!(joined.contains(&"--exclude=*".to_string()), "got {joined:?}");
+        assert!(
+            joined.contains(&"--include=*.so".to_string()),
+            "got {joined:?}"
+        );
+        assert!(
+            joined.contains(&"--exclude=*".to_string()),
+            "got {joined:?}"
+        );
         assert!(
             joined.contains(&"gpu-box:.mamba/widget/target/debug/deps/".to_string()),
             "got {joined:?}"
@@ -510,7 +625,11 @@ mod tests {
         fs::create_dir_all(src.join("proto-abc123/out")).unwrap();
         fs::create_dir_all(&dst).unwrap();
         fs::write(src.join("proto-abc123/out/api.rs"), "pub struct Req;").unwrap();
-        fs::write(src.join("proto-abc123/build-script-build"), "x".repeat(5000)).unwrap();
+        fs::write(
+            src.join("proto-abc123/build-script-build"),
+            "x".repeat(5000),
+        )
+        .unwrap();
         fs::write(src.join("proto-abc123/out/schema.bin"), "y".repeat(5000)).unwrap();
 
         let mut args: Vec<OsString> = vec![
@@ -553,7 +672,10 @@ mod tests {
         let config = crate::config::Config::discover(&dir).unwrap().unwrap();
 
         let (args, local) = generated_source_args(&config, &["--release".to_string()]);
-        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
 
         assert!(
             joined.contains(&"--prune-empty-dirs".to_string()),
