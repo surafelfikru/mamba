@@ -64,9 +64,12 @@ pub(crate) fn profile_of(args: &[String]) -> &'static str {
 fn pull_args(config: &Config, name: &str, args: &[String]) -> (Vec<OsString>, PathBuf) {
     let rel = format!("target/{}/{name}", profile_of(args));
 
+    // The host holds both a full binary and a stripped one. Only the stripped one
+    // travels, but it lands under the plain name so everything downstream — running
+    // it, a debugger, a script — finds it exactly where a local build would have.
     let local = config.root.as_path().join(&rel);
     let remote = format!(
-        "{}:{}/{rel}",
+        "{}:{}/{rel}.slim",
         config.host.as_str(),
         config.remote_dir.as_str()
     );
@@ -208,8 +211,31 @@ mod tests {
         assert!(local.ends_with("target/debug/widget"), "got {local:?}");
         let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(
-            joined.contains(&"gpu-box:.mamba/widget/target/debug/widget".to_string()),
+            joined.contains(&"gpu-box:.mamba/widget/target/debug/widget.slim".to_string()),
             "got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn pull_fetches_the_slim_binary_but_lands_it_at_the_plain_local_path() {
+        let dir = tmpdir("pull-slim");
+        fs::write(
+            dir.join(crate::config::CONFIG_FILE),
+            "host = \"gpu-box\"\nremote_dir = \".mamba/widget\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::discover(&dir).unwrap().unwrap();
+
+        let (args, local) = pull_args(&config, "widget", &[]);
+        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+        assert!(
+            joined.contains(&"gpu-box:.mamba/widget/target/debug/widget.slim".to_string()),
+            "remote side should fetch the slim file, got {joined:?}"
+        );
+        assert!(
+            local.ends_with("target/debug/widget"),
+            "local side must be the plain name cargo would have written, got {local:?}"
         );
     }
 
