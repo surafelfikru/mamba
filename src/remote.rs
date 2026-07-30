@@ -110,9 +110,23 @@ pub enum BuildOutcome {
 /// indistinguishable at a glance from cargo not being installed at all. Sourcing the
 /// same file rustup itself tells you to source sidesteps that regardless of the
 /// remote's shell or rc setup.
-pub fn remote_command(dir: &RemoteDir, args: &[Quoted], post_build: &str) -> String {
+pub fn remote_command(
+    dir: &RemoteDir,
+    local_root: &Path,
+    args: &[Quoted],
+    post_build: &str,
+) -> String {
+    // DWARF records the absolute path of the directory the compiler ran in. Left
+    // alone that is the server's path, which means a local debugger finds line
+    // numbers but no source file. `$PWD` is expanded by the remote shell after the
+    // `cd`, so the rewrite needs no knowledge of the remote home directory.
+    let remap = format!(
+        "RUSTFLAGS=\"--remap-path-prefix=$PWD=\"{}",
+        Quoted::new(&local_root.to_string_lossy()).as_str()
+    );
+
     let mut command = format!(
-        ". \"$HOME/.cargo/env\" 2>/dev/null; cd {} && CARGO_TERM_COLOR=always cargo build",
+        ". \"$HOME/.cargo/env\" 2>/dev/null; cd {} && {remap} CARGO_TERM_COLOR=always cargo build",
         Quoted::new(dir.as_str()).as_str()
     );
     for arg in args {
@@ -140,7 +154,7 @@ pub fn remote_command(dir: &RemoteDir, args: &[Quoted], post_build: &str) -> Str
 /// connect, which is why it maps to `Unreachable` while every other status is the
 /// remote cargo's own.
 pub fn build(config: &Config, args: &[Quoted], post_build: &str) -> BuildOutcome {
-    let command = remote_command(&config.remote_dir, args, post_build);
+    let command = remote_command(&config.remote_dir, config.root.as_path(), args, post_build);
 
     match Command::new("ssh")
         .arg(config.host.as_str())
@@ -315,9 +329,30 @@ mod tests {
     }
 
     #[test]
+    fn remote_command_remaps_the_build_path_to_the_local_project_root() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
+
+        // $PWD is left for the remote shell to expand — it is the only way to learn
+        // the host's absolute path without a second round trip to ask for it.
+        assert!(
+            cmd.contains("RUSTFLAGS=\"--remap-path-prefix=$PWD=\"'/home/me/proj'"),
+            "got {cmd}"
+        );
+    }
+
+    #[test]
+    fn remap_survives_a_project_path_containing_a_quote() {
+        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let cmd = remote_command(&dir, Path::new("/home/me/it's"), &[], "");
+
+        assert!(cmd.contains(r"'/home/me/it'\''s'"), "got {cmd}");
+    }
+
+    #[test]
     fn remote_command_preserves_the_build_exit_code_across_the_post_build_step() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[], "echo split");
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "echo split");
 
         // rc is captured immediately after cargo and re-exited at the end, so a
         // compile failure stays a compile failure no matter what the split step does.
@@ -330,20 +365,22 @@ mod tests {
     }
 
     #[test]
-    fn remote_command_without_a_post_build_step_is_unchanged() {
+    fn remote_command_without_a_post_build_step_has_no_exit_code_plumbing() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[], "");
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
 
         assert_eq!(
             cmd,
-            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build"
+            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && \
+             RUSTFLAGS=\"--remap-path-prefix=$PWD=\"'/home/me/proj' \
+             CARGO_TERM_COLOR=always cargo build"
         );
     }
 
     #[test]
     fn remote_command_sources_cargo_env_before_anything_else() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[], "");
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
 
         assert!(
             cmd.starts_with(". \"$HOME/.cargo/env\" 2>/dev/null; "),
@@ -354,11 +391,13 @@ mod tests {
     #[test]
     fn remote_command_changes_directory_and_forces_colour() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[], "");
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
 
         assert_eq!(
             cmd,
-            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build"
+            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && \
+             RUSTFLAGS=\"--remap-path-prefix=$PWD=\"'/home/me/proj' \
+             CARGO_TERM_COLOR=always cargo build"
         );
     }
 
@@ -371,18 +410,20 @@ mod tests {
             Quoted::new("a b"),
         ];
 
-        let cmd = remote_command(&dir, &args, "");
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &args, "");
 
         assert_eq!(
             cmd,
-            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && CARGO_TERM_COLOR=always cargo build '--release' '--features' 'a b'"
+            ". \"$HOME/.cargo/env\" 2>/dev/null; cd '.mamba/proj' && \
+             RUSTFLAGS=\"--remap-path-prefix=$PWD=\"'/home/me/proj' \
+             CARGO_TERM_COLOR=always cargo build '--release' '--features' 'a b'"
         );
     }
 
     #[test]
     fn remote_command_cannot_be_hijacked_by_a_malicious_flag() {
         let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, &[Quoted::new("; rm -rf ~")], "");
+        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[Quoted::new("; rm -rf ~")], "");
 
         // The whole thing stays one quoted argument to cargo.
         assert!(cmd.ends_with("cargo build '; rm -rf ~'"), "got {cmd}");
