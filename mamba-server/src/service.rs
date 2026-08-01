@@ -187,8 +187,11 @@ impl Control for ControlService {
             .current_dir(&dir)
             .env("PATH", cargo_path())
             .env("CARGO_TERM_COLOR", "always")
+            // The encoded variant, not RUSTFLAGS: cargo splits the plain one on
+            // whitespace, so a client root containing a space would break the remap flag
+            // in two. Encoded flags are 0x1f-separated; a single flag needs no separator.
             .env(
-                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
                 format!("--remap-path-prefix={}={}", dir.display(), req.local_root),
             )
             .stdout(std::process::Stdio::piped())
@@ -403,6 +406,46 @@ mod tests {
 
         assert!(root.join("fresh").is_dir());
         assert_eq!(t.path, root.join("fresh").display().to_string());
+    }
+
+    #[tokio::test]
+    async fn a_client_root_containing_a_space_still_builds() {
+        // The remap flag embeds the client's project path. Under plain RUSTFLAGS cargo
+        // splits on the space and rustc rejects the mangled flags; the encoded variant
+        // carries it whole.
+        use mamba_core::proto::build_event::Payload;
+        use mamba_core::proto::control_server::Control;
+        use tokio_stream::StreamExt;
+
+        let root = tmpdir("svc-space");
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let svc = service(&root);
+        let stream = svc
+            .start_build(tonic::Request::new(mamba_core::proto::BuildRequest {
+                project_id: "proj".to_string(),
+                args: vec![],
+                local_root: "/home/dev/my proj".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let mut stream = stream.into_inner();
+        let mut exit = None;
+        while let Some(event) = stream.next().await {
+            if let Some(Payload::ExitCode(c)) = event.unwrap().payload {
+                exit = Some(c);
+            }
+        }
+
+        assert_eq!(exit, Some(0), "a space in the client's path must not fail the build");
     }
 
     #[tokio::test]

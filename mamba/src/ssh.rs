@@ -56,9 +56,14 @@ impl Quoted {
 ///
 /// `$PWD` is expanded by the remote shell after the `cd`, so the path rewrite needs no
 /// knowledge of the remote home directory.
+///
+/// The remap travels as `CARGO_ENCODED_RUSTFLAGS` rather than `RUSTFLAGS` because cargo
+/// splits the plain variant on whitespace — a project root containing a space would break
+/// the flag in two and fail the build. The encoded variant is 0x1f-separated, and with
+/// exactly one flag needs no separator at all.
 fn build_command(remote_dir: &str, local_root: &str, args: &[String]) -> String {
     let remap = format!(
-        "RUSTFLAGS=\"--remap-path-prefix=$PWD=\"{}",
+        "CARGO_ENCODED_RUSTFLAGS=\"--remap-path-prefix=$PWD=\"{}",
         Quoted::new(local_root).as_str()
     );
 
@@ -370,6 +375,24 @@ mod tests {
         assert!(
             command.contains("'--release'"),
             "flags must reach cargo quoted: {command}"
+        );
+    }
+
+    #[test]
+    fn the_remap_survives_a_project_path_containing_a_space() {
+        // Cargo splits RUSTFLAGS on whitespace, so a root like "/home/dev/my proj" turns
+        // the remap flag into two garbage arguments and rustc rejects the build.
+        // CARGO_ENCODED_RUSTFLAGS is 0x1f-separated instead, and with a single flag needs
+        // no separator at all — the whole value is one flag, spaces included.
+        let command = build_command(".mamba/proj", "/home/dev/my proj", &[]);
+
+        assert!(
+            command.contains("CARGO_ENCODED_RUSTFLAGS="),
+            "must use the encoded variant, cargo splits plain RUSTFLAGS on spaces: {command}"
+        );
+        assert!(
+            !command.contains(" RUSTFLAGS="),
+            "plain RUSTFLAGS would shadow the fix: {command}"
         );
     }
 }
