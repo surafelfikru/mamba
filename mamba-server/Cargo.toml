@@ -2,3 +2,9 @@
 name = "mamba-server"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+mamba-core = { path = "../mamba-core" }
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
