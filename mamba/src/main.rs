@@ -220,7 +220,7 @@ fn status(verb: &str, message: &str) {
 fn print_usage() {
     eprintln!(
         "\
-mamba builds your Rust project on another machine.
+Mamba(🐍) builds your Rust project on another machine.
 
 Install the shim, once:
     ln -s \"$(command -v mamba)\" ~/.local/bin/cargo
@@ -365,6 +365,4 @@ mod tests {
         assert!(answer_means_yes("yes"));
         assert!(answer_means_yes("sure"));
     }
-
-
 }

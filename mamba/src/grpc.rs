@@ -95,9 +95,11 @@ mod tests {
     async fn connecting_where_nothing_listens_is_an_error_not_a_panic() {
         // Port 1 never has a mamba-server. This must surface as ChannelError so the
         // daemon falls back to ssh rather than failing the build.
-        assert!(GrpcControlChannel::connect("http://127.0.0.1:1")
-            .await
-            .is_err());
+        assert!(
+            GrpcControlChannel::connect("http://127.0.0.1:1")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
