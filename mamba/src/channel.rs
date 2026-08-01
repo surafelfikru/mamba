@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use mamba_core::proto::artifact_request::Kind;
-use mamba_core::proto::{build_event, BuildEvent, TransferTarget};
+use mamba_core::proto::{BuildEvent, TransferTarget};
 use std::pin::Pin;
 use tokio_stream::Stream;
 
@@ -50,6 +50,10 @@ pub trait ControlChannel: Send + Sync {
     ) -> Result<TransferTarget, ChannelError>;
 }
 
+#[cfg(test)]
+use mamba_core::proto::build_event;
+
+#[cfg(test)]
 /// An in-memory channel for testing the daemon without a server or a network.
 ///
 /// It advertises a host deliberately unlike any control endpoint, which is what the
@@ -58,6 +62,7 @@ pub struct MockChannel {
     host: String,
 }
 
+#[cfg(test)]
 impl MockChannel {
     pub fn new(host: &str) -> MockChannel {
         MockChannel {
@@ -92,8 +97,10 @@ impl MockChannel {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl ControlChannel for MockChannel {
+    // build_event is only needed by this test double.
     async fn request_upload(&self, _project_id: &str) -> Result<TransferTarget, ChannelError> {
         Ok(self.target(""))
     }

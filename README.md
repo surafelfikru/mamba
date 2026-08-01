@@ -21,10 +21,21 @@ The platform uses:
 
 ## What works today
 
-The first slice is in: `cargo build` is intercepted and run over ssh on a machine you
-pick, with the compiler output streaming back to your terminal. Source is pushed with
-rsync, so only what changed moves; the remote `target/` directory stays put and acts as
-the build cache.
+`cargo build` is intercepted and run on a machine you pick, with the compiler output
+streaming back to your terminal. Source is pushed with rsync, so only what changed moves;
+the remote `target/` directory stays put and acts as the build cache.
+
+Builds go through a small local daemon that keeps its connection to the build host open
+between builds, rather than opening a fresh ssh connection per step.
+
+Nothing needs installing on the build host — an ordinary ssh destination with a Rust
+toolchain is enough. If a `mamba-server` happens to be listening on port 7777, Mamba uses
+that instead, which lets the host decide where projects live and where builds run. Which
+transport was chosen appears in the `Syncing` line of every build.
+
+`mamba-server` currently accepts connections without authentication or encryption. Run it
+only on a network you trust. The plain ssh path is unaffected — it is encrypted and
+authenticated as it always was.
 
 `sccache`, object storage, containers, and dedicated workers are not built yet.
 
@@ -54,10 +65,13 @@ Create `.mamba.toml` in any project you want built remotely:
 
 ```toml
 host = "gpu-box"              # any ssh destination, or an alias from ~/.ssh/config
-remote_dir = ".mamba/myproj"  # optional; relative paths sit in the remote home dir
 pull = false                  # optional; fetch the built binary after a successful build
 symbols = false               # optional; also fetch its debug symbols
 ```
+
+`host` is the only setting that names the build machine. Where the project lands over
+there is not your decision to make any more — the build host answers that, and the
+project is identified by its directory name.
 
 That file is the entire opt-in. Projects without one are untouched.
 
@@ -114,6 +128,6 @@ If the remote is unreachable, Mamba asks whether to build locally instead. With 
 terminal to ask on it falls back automatically and says so. A compile error is never
 treated as a network problem, so a failing build never silently recompiles locally.
 
-Two projects with the same directory name share a default `remote_dir`. Set `remote_dir`
-explicitly if that affects you.
+Two projects with the same directory name share a remote build directory, because the
+directory name is what identifies a project. Rename one if that affects you.
 

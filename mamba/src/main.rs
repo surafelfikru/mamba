@@ -16,6 +16,12 @@ use std::process::{Command, ExitCode};
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
 
+    // The daemon runs from this same binary. It is spawned by the shim, never by a
+    // person, so it stays out of the usage text.
+    if argv.get(1).map(String::as_str) == Some("--daemon") {
+        return daemon::run();
+    }
+
     let invoked_as = argv
         .first()
         .map(Path::new)
@@ -56,9 +62,94 @@ fn main() -> ExitCode {
         Some(Ok(config)) => config,
     };
 
-    let _ = &config;
-    // Rebuilt on the daemon in a later task.
-    return ExitCode::from(0);
+    let request = ipc::Request {
+        // Cargo's own flags, without the `build` subcommand the shim matched on.
+        args: args[1..].to_vec(),
+        root: config.root.as_path().display().to_string(),
+        host: config.host.as_str().to_string(),
+        project_id: config.project_id.clone(),
+        pull: cli_pull || config.pull,
+        symbols: cli_symbols || config.symbols,
+    };
+
+    let mut stream = match connect_or_spawn_daemon() {
+        Ok(s) => s,
+        Err(e) => return offer_local_build(&config, &args, &e),
+    };
+
+    if let Err(e) = ipc::write_request(&mut stream, &request) {
+        return offer_local_build(&config, &args, &format!("could not send the request: {e}"));
+    }
+
+    match relay_frames(&mut stream) {
+        Ok(Some(code)) => ExitCode::from(code.clamp(0, 255) as u8),
+        Ok(None) => offer_local_build(&config, &args, "the daemon closed without answering"),
+        Err(why) => offer_local_build(&config, &args, &why),
+    }
+}
+
+/// Connects to the daemon, starting one if nothing answers.
+///
+/// The daemon is detached into its own process group so it outlives this shim and keeps
+/// its connections warm for the next build. A socket file that exists but refuses a
+/// connection is a leftover from a killed daemon; the new daemon clears it on bind.
+fn connect_or_spawn_daemon() -> Result<std::os::unix::net::UnixStream, String> {
+    use std::os::unix::net::UnixStream;
+
+    let path = ipc::socket_path();
+    if let Ok(stream) = UnixStream::connect(&path) {
+        return Ok(stream);
+    }
+
+    let me = std::env::current_exe().map_err(|e| format!("cannot find my own path: {e}"))?;
+    Command::new(me)
+        .arg("--daemon")
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start the daemon: {e}"))?;
+
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(stream) = UnixStream::connect(&path) {
+            return Ok(stream);
+        }
+    }
+    Err("the daemon did not start within five seconds".to_string())
+}
+
+/// Writes the daemon's frames to this process's own stdio as they arrive.
+///
+/// Every frame is flushed immediately. The output has already crossed two hops to get
+/// here, and buffering it a third time is what would make a live build feel batched.
+///
+/// Returns the build's exit code, or `None` if the stream ended without one.
+fn relay_frames(stream: &mut std::os::unix::net::UnixStream) -> Result<Option<i32>, String> {
+    let mut reader = stream
+        .try_clone()
+        .map_err(|e| format!("could not read from the daemon: {e}"))?;
+
+    loop {
+        match ipc::read_frame(&mut reader) {
+            Err(e) => return Err(format!("the daemon connection broke: {e}")),
+            Ok(None) => return Ok(None),
+            Ok(Some(ipc::Frame::Stdout(bytes))) => {
+                let mut out = io::stdout();
+                let _ = out.write_all(&bytes);
+                let _ = out.flush();
+            }
+            Ok(Some(ipc::Frame::Stderr(bytes))) => {
+                let mut err = io::stderr();
+                let _ = err.write_all(&bytes);
+                let _ = err.flush();
+            }
+            Ok(Some(ipc::Frame::Status(verb, message))) => status(&verb, &message),
+            Ok(Some(ipc::Frame::Failed(why))) => return Err(why),
+            Ok(Some(ipc::Frame::Exit(code))) => return Ok(Some(code)),
+        }
+    }
 }
 
 /// Tells the user the remote is down and asks whether to fall back to a local build.
@@ -125,33 +216,6 @@ fn status(verb: &str, message: &str) {
     }
 }
 
-/// The project directory's name, used only to label status lines — falls back to
-/// "project" on the off chance the path has no final component.
-fn project_name(config: &Config) -> &str {
-    config
-        .root
-        .as_path()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("project")
-}
-
-/// Renders a byte count the way a human reads it, e.g. `4.16 MB`.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.2} {}", UNITS[unit])
-    }
-}
-
 /// Explains how to install the shim, shown when the binary is run as `mamba`.
 fn print_usage() {
     eprintln!(
@@ -209,6 +273,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mamba-{tag}-{}-{stamp}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_leftover_socket_file_does_not_masquerade_as_a_running_daemon() {
+        // A killed daemon leaves its socket behind. Connecting must fail so the shim
+        // starts a new one rather than hanging against a dead path.
+        let dir = tmpdir("stale-socket");
+        let socket = dir.join("daemon.sock");
+        fs::write(&socket, "not a real socket").unwrap();
+
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_err());
     }
 
     #[test]
@@ -291,16 +366,5 @@ mod tests {
         assert!(answer_means_yes("sure"));
     }
 
-    #[test]
-    fn human_size_stays_in_bytes_under_a_kilobyte() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(512), "512 B");
-    }
 
-    #[test]
-    fn human_size_picks_the_largest_unit_that_keeps_it_readable() {
-        assert_eq!(human_size(1024), "1.00 KB");
-        assert_eq!(human_size(4_362_824), "4.16 MB");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1.00 GB");
-    }
 }
