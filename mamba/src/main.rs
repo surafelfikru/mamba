@@ -2,6 +2,7 @@ mod channel;
 mod config;
 mod grpc;
 mod ssh;
+mod transfer;
 
 use config::Config;
 use std::ffi::OsStr;
