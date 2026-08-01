@@ -1,5 +1,6 @@
 mod channel;
 mod config;
+mod daemon;
 mod grpc;
 mod ipc;
 mod ssh;
