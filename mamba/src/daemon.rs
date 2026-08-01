@@ -7,8 +7,8 @@
 //!
 //! It never decides where anything lives on the far side. It asks, then obeys.
 
-use crate::channel::ControlChannel;
-use crate::grpc::{GrpcControlChannel, GRPC_PORT};
+use crate::channel::{ChannelError, ControlChannel};
+use crate::grpc::{GRPC_PORT, GrpcControlChannel};
 use crate::ipc::{self, Frame, Request};
 use crate::ssh::SshControlChannel;
 use crate::transfer;
@@ -27,6 +27,31 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long to wait for a `mamba-server` before falling back to plain ssh.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long any single call on an already-open channel gets before it's treated as dead.
+///
+/// The probe above only bounds the *first* connection attempt. A channel that connects
+/// successfully and is then cached can still go silent later — the observed case was an
+/// idle TCP connection a NAT dropped without sending a reset, which the OS's own
+/// retransmission timers took upward of fifteen minutes to notice. Every call made
+/// through a cached channel needs its own bound, or exactly that hang recurs.
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds a channel call, turning "never answers" into a prompt, ordinary [`ChannelError`]
+/// — the same error a channel that failed to connect at all would produce, so the caller
+/// does not need a second failure path for it.
+async fn bounded<T>(
+    limit: Duration,
+    call: impl std::future::Future<Output = Result<T, ChannelError>>,
+) -> Result<T, ChannelError> {
+    match tokio::time::timeout(limit, call).await {
+        Ok(result) => result,
+        Err(_) => Err(ChannelError(format!(
+            "no response within {}s — the connection may be dead",
+            limit.as_secs()
+        ))),
+    }
+}
 
 /// Open channels, keyed by host, with the transport's name and when each was last used.
 pub struct ChannelCache {
@@ -90,15 +115,20 @@ async fn open_channel(host: &str) -> (Arc<dyn ControlChannel>, &'static str) {
 /// The order is fixed: ask where to push, push, build, then ask for each artifact wanted.
 /// Editor artifacts come down after every successful build because rust-analyzer needs
 /// them whether or not anyone asked for the binary.
+///
+/// `rpc_timeout` bounds every call made on `channel` — see [`RPC_TIMEOUT`] for why this
+/// exists. Callers outside tests should pass that constant; tests pass a short duration so
+/// proving a hang is fixed doesn't cost the test suite the length of the real timeout.
 pub async fn handle(
     request: &Request,
     channel: &dyn ControlChannel,
     out: &mut impl Write,
     transport: &str,
+    rpc_timeout: Duration,
 ) -> io::Result<()> {
     let root = Path::new(&request.root);
 
-    let upload = match channel.request_upload(&request.project_id).await {
+    let upload = match bounded(rpc_timeout, channel.request_upload(&request.project_id)).await {
         Ok(t) => t,
         Err(e) => return ipc::write_frame(out, &Frame::Failed(e.to_string())),
     };
@@ -114,9 +144,11 @@ pub async fn handle(
         return ipc::write_frame(out, &Frame::Failed(e));
     }
 
-    let mut stream = match channel
-        .start_build(&request.project_id, &request.args, &request.root)
-        .await
+    let mut stream = match bounded(
+        rpc_timeout,
+        channel.start_build(&request.project_id, &request.args, &request.root),
+    )
+    .await
     {
         Ok(s) => s,
         Err(e) => return ipc::write_frame(out, &Frame::Failed(e.to_string())),
@@ -147,7 +179,7 @@ pub async fn handle(
         for kind in wanted {
             // A failed fetch is reported and forgotten. The build already succeeded, and
             // its exit code is the answer the caller asked for.
-            match channel.request_artifact(&request.project_id, kind).await {
+            match bounded(rpc_timeout, channel.request_artifact(&request.project_id, kind)).await {
                 Err(e) => {
                     ipc::write_frame(out, &Frame::Stderr(format!("mamba: {e}\n").into_bytes()))?
                 }
@@ -255,7 +287,7 @@ async fn serve_one(
         }
     };
 
-    handle(&request, channel.as_ref(), &mut writer, transport).await
+    handle(&request, channel.as_ref(), &mut writer, transport, RPC_TIMEOUT).await
 }
 
 #[cfg(test)]
@@ -290,9 +322,15 @@ mod tests {
         // arrives before it: the status line naming the transport. That line is the whole
         // mitigation for a probe that silently falls back — without it, a server merely
         // being down is invisible.
-        handle(&request(false), &MockChannel::new("worker-7"), &mut out, "mock")
-            .await
-            .unwrap();
+        handle(
+            &request(false),
+            &MockChannel::new("worker-7"),
+            &mut out,
+            "mock",
+            RPC_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
         let frames = frames(&out);
         assert!(
@@ -326,8 +364,78 @@ mod tests {
         let mut cache = ChannelCache::new(Duration::from_secs(600));
         cache.insert("gpu-box", Arc::new(MockChannel::new("w")), "mock");
 
-        let (_, transport) = cache.get("gpu-box").expect("the channel must still be there");
+        let (_, transport) = cache
+            .get("gpu-box")
+            .expect("the channel must still be there");
 
         assert_eq!(transport, "mock");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_never_resolves_times_out_instead_of_hanging_forever() {
+        // Reproduces the real bug: a cached connection that looks alive at the TCP level
+        // but the far end never answers — the classic idle-NAT-death case, where a
+        // connection sits cached and unused until a router silently drops the mapping
+        // with no RST. Without a bound this hangs for as long as the OS's own TCP
+        // retransmission timers allow, which in practice ran past 15 minutes.
+        let never = std::future::pending::<Result<i32, ChannelError>>();
+
+        let result = bounded(Duration::from_millis(50), never).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hanging_channel_fails_the_build_promptly_instead_of_blocking_it() {
+        let mut out = Vec::new();
+
+        // A short bound here proves the mechanism works without the test itself waiting
+        // out the real RPC_TIMEOUT.
+        handle(
+            &request(false),
+            &HangingChannel,
+            &mut out,
+            "grpc",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        let frames = frames(&out);
+        assert!(
+            frames.iter().any(|f| matches!(f, Frame::Failed(_))),
+            "a dead connection must surface as a failure, not silence: {frames:?}"
+        );
+    }
+
+    /// A channel whose first call never resolves — stands in for a TCP connection that
+    /// died silently. Used only to prove `handle` cannot be blocked by it forever.
+    struct HangingChannel;
+
+    #[async_trait::async_trait]
+    impl ControlChannel for HangingChannel {
+        async fn request_upload(
+            &self,
+            _project_id: &str,
+        ) -> Result<mamba_core::proto::TransferTarget, ChannelError> {
+            std::future::pending().await
+        }
+
+        async fn start_build(
+            &self,
+            _project_id: &str,
+            _args: &[String],
+            _local_root: &str,
+        ) -> Result<crate::channel::BuildStream, ChannelError> {
+            unreachable!("handle must fail on request_upload before reaching this")
+        }
+
+        async fn request_artifact(
+            &self,
+            _project_id: &str,
+            _kind: Kind,
+        ) -> Result<mamba_core::proto::TransferTarget, ChannelError> {
+            unreachable!("handle must fail on request_upload before reaching this")
+        }
     }
 }
