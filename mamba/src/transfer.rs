@@ -14,21 +14,28 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The `-e` argument that makes rsync reuse one ssh connection for every transfer.
+/// The `-e` argument that makes rsync reuse one ssh connection for every transfer, and
+/// honours the target's port when it names a nonstandard one.
 ///
 /// `ControlPath` is a unix socket path, and `sockaddr_un` caps those at 108 bytes — a
 /// descriptive path silently breaks multiplexing, so `%C` (a 40-character hash of the
 /// destination) under a short directory is used instead.
-pub fn ssh_control_args() -> Vec<OsString> {
+///
+/// Port 22 (and 0, the proto's unset default) is deliberately left off the command line:
+/// it is what ssh does anyway, and forcing `-p 22` would clobber a port set for this host
+/// in `~/.ssh/config`.
+pub fn ssh_control_args(port: u32) -> Vec<OsString> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let control_path = format!("{home}/.mamba/cm-%C");
 
-    vec![
-        OsString::from("-e"),
-        OsString::from(format!(
-            "ssh -o ControlMaster=auto -o ControlPath={control_path} -o ControlPersist=600"
-        )),
-    ]
+    let mut ssh = format!(
+        "ssh -o ControlMaster=auto -o ControlPath={control_path} -o ControlPersist=600"
+    );
+    if port != 0 && port != 22 {
+        ssh.push_str(&format!(" -p {port}"));
+    }
+
+    vec![OsString::from("-e"), OsString::from(ssh)]
 }
 
 /// Makes sure the directory holding multiplexing sockets exists.
@@ -66,7 +73,7 @@ fn push_args(root: &Path, target: &TransferTarget) -> Vec<OsString> {
         OsString::from("--exclude=.git/"),
         OsString::from(format!("--rsync-path=mkdir -p '{}' && rsync", target.path)),
     ];
-    args.extend(ssh_control_args());
+    args.extend(ssh_control_args(target.port));
     args.push(source);
     args.push(OsString::from(format!("{}/", remote_spec(target))));
     args
@@ -100,7 +107,7 @@ fn fetch_args(root: &Path, target: &TransferTarget, kind: Kind) -> (Vec<OsString
         Kind::Binary | Kind::Symbols => {}
     }
 
-    args.extend(ssh_control_args());
+    args.extend(ssh_control_args(target.port));
 
     let directory = matches!(kind, Kind::ProcMacros | Kind::GeneratedSource);
     let remote = if directory {
@@ -172,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_control_path_stays_under_the_sockaddr_un_limit() {
-        let joined = strings(&ssh_control_args()).join(" ");
+        let joined = strings(&ssh_control_args(22)).join(" ");
         let path = joined
             .split("ControlPath=")
             .nth(1)
@@ -219,6 +226,39 @@ mod tests {
         assert!(strings(&args)
             .iter()
             .any(|a| a.contains("some-other-worker")));
+    }
+
+    #[test]
+    fn a_nonstandard_port_reaches_the_ssh_command_line() {
+        // The contract the other tests advertise — the client obeys the target exactly —
+        // has to include the port, or a server advertising one is silently ignored.
+        let root = std::path::Path::new("/home/dev/proj");
+        let mut t = target("h", "/p", "target/debug/app");
+        t.port = 2222;
+
+        let (args, _) = fetch_args(root, &t, Kind::Binary);
+
+        assert!(
+            strings(&args).iter().any(|a| a.contains("-p 2222")),
+            "port 2222 must appear in the -e ssh line: {:?}",
+            strings(&args)
+        );
+    }
+
+    #[test]
+    fn the_default_port_stays_off_the_command_line() {
+        // Port 22 is what ssh does anyway, and omitting it keeps ~/.ssh/config free to
+        // override the port for aliases — an explicit -p 22 would clobber that.
+        let root = std::path::Path::new("/home/dev/proj");
+        let t = target("h", "/p", "target/debug/app");
+
+        let (args, _) = fetch_args(root, &t, Kind::Binary);
+
+        assert!(
+            !strings(&args).iter().any(|a| a.contains("-p ")),
+            "the default port must not be forced: {:?}",
+            strings(&args)
+        );
     }
 
     #[test]
