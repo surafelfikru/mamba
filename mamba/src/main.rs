@@ -1,5 +1,6 @@
 mod channel;
 mod config;
+mod grpc;
 mod ssh;
 
 use config::Config;
