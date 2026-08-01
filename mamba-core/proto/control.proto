@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package mamba.control.v1;
+
+// The answering side owns every decision about where bytes live. The asking side obeys
+// the answers and never constructs a path of its own.
+service Control {
+  rpc RequestUpload(UploadRequest) returns (TransferTarget);
+  rpc StartBuild(BuildRequest) returns (stream BuildEvent);
+  rpc RequestArtifact(ArtifactRequest) returns (TransferTarget);
+}
+
+message UploadRequest {
+  string project_id = 1;
+}
+
+message BuildRequest {
+  string project_id = 1;
+  repeated string args = 2;
+  string local_root = 3;
+}
+
+message BuildEvent {
+  oneof payload {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+  }
+}
+
+message ArtifactRequest {
+  string project_id = 1;
+  Kind kind = 2;
+
+  enum Kind {
+    BINARY = 0;
+    SYMBOLS = 1;
+    PROC_MACROS = 2;
+    GENERATED_SOURCE = 3;
+  }
+}
+
+message TransferTarget {
+  string host = 1;
+  uint32 port = 2;
+  string user = 3;
+  string path = 4;
+  string relative_path = 5;
+}

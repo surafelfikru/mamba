@@ -2,3 +2,12 @@
 name = "mamba-core"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+toml.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
