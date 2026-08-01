@@ -1,4 +1,3 @@
-mod artifact;
 mod config;
 mod remote;
 
@@ -62,60 +61,10 @@ fn main() -> ExitCode {
 
     let flags: Vec<Quoted> = args[1..].iter().map(|a| Quoted::new(a)).collect();
 
-    // Remote cargo's own "Compiling"/"Finished" lines stream in right after this,
-    // over the ssh child's inherited stdio — so the sync line above and the pull
-    // line below read as one continuous build log, not three separate tools.
-    // Splitting runs on the host, using the CPU we are already paying for. It is
-    // skipped silently when the binary name cannot be resolved — a workspace, say —
-    // because a missing optimisation must never fail a build.
-    let post_build = match artifact::binary_name(config.root.as_path()) {
-        Ok(name) => artifact::split_command(&artifact::target_subdir(&args[1..]), &name),
-        Err(_) => String::new(),
-    };
+    // Artifact fetching is being rebuilt on the daemon; the post-build split moves to
+    // whichever side ran the build.
+    let post_build = String::new();
     let outcome = remote::build(&config, &flags, &post_build);
-
-    if matches!(outcome, BuildOutcome::Finished(0)) && (cli_pull || config.pull) {
-        status("Downloading", &format!("{project} from {}", config.host.as_str()));
-        let started = std::time::Instant::now();
-        match artifact::pull(&config, &args[1..]) {
-            Ok(path) => {
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                status(
-                    "Downloaded",
-                    &format!("{} ({}) in {:.2}s", path.display(), human_size(size), started.elapsed().as_secs_f64()),
-                );
-            }
-            Err(e) => eprintln!("mamba: pull failed: {e}"),
-        }
-
-        if cli_symbols || config.symbols {
-            match artifact::pull_symbols(&config, &args[1..]) {
-                Ok(p) => {
-                    let n = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                    status("Symbols", &format!("{} ({})", p.display(), human_size(n)));
-                }
-                Err(e) => eprintln!("mamba: symbols unavailable: {e}"),
-            }
-        }
-
-    }
-
-    // Editor support is not tied to wanting the binary. rust-analyzer needs the
-    // proc-macro libraries to expand derives and the generated sources to resolve
-    // anything a build script produced, whether or not the developer asked for the
-    // executable — so these run on every successful build, including the common
-    // `pull = false` case where nothing else comes home.
-    if matches!(outcome, BuildOutcome::Finished(0)) {
-        match artifact::sync_proc_macros(&config, &args[1..]) {
-            Ok(0) => {}
-            Ok(n) => status("Macros", &format!("{n} proc-macro libraries")),
-            Err(e) => eprintln!("mamba: proc-macro sync failed: {e}"),
-        }
-
-        if let Err(e) = artifact::sync_generated_source(&config, &args[1..]) {
-            eprintln!("mamba: generated-source sync failed: {e}");
-        }
-    }
 
     match outcome {
         BuildOutcome::Finished(code) => ExitCode::from(code.clamp(0, 255) as u8),

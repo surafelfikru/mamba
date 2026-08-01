@@ -5,6 +5,8 @@
 //! server resolves paths for the gRPC transport, and the SSH transport resolves the same
 //! paths locally because it has no server to ask.
 
+pub mod layout;
+
 pub mod proto {
     tonic::include_proto!("mamba.control.v1");
 }
