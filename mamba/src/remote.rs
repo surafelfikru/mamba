@@ -1,4 +1,4 @@
-use crate::config::{Config, RemoteDir};
+use crate::config::Config;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
@@ -39,13 +39,13 @@ impl Quoted {
 /// telling the receiving side never to delete that path — necessary because ignore
 /// rules apply only to the sender, so without it `--delete` wipes the remote build
 /// cache on every run.
-pub fn rsync_args(root: &Path, host: &str, dir: &RemoteDir) -> Vec<OsString> {
+pub fn rsync_args(root: &Path, host: &str, dir: &str) -> Vec<OsString> {
     let mut source = root.as_os_str().to_os_string();
     source.push("/");
 
     let remote_path = format!(
         "--rsync-path=mkdir -p {} && rsync",
-        Quoted::new(dir.as_str()).as_str()
+        Quoted::new(dir).as_str()
     );
 
     vec![
@@ -56,8 +56,13 @@ pub fn rsync_args(root: &Path, host: &str, dir: &RemoteDir) -> Vec<OsString> {
         OsString::from("--exclude=.git/"),
         OsString::from(remote_path),
         source,
-        OsString::from(format!("{host}:{}/", dir.as_str())),
+        OsString::from(format!("{host}:{dir}/")),
     ]
+}
+
+/// Where a project lands on the far side, by convention.
+fn remote_dir(config: &Config) -> String {
+    format!(".mamba/{}", config.project_id)
 }
 
 /// Pushes the project to the remote machine, creating the destination if needed.
@@ -70,7 +75,7 @@ pub fn sync(config: &Config) -> Result<(), String> {
     let args = rsync_args(
         config.root.as_path(),
         config.host.as_str(),
-        &config.remote_dir,
+        &remote_dir(config),
     );
 
     match Command::new("rsync").args(&args).status() {
@@ -111,7 +116,7 @@ pub enum BuildOutcome {
 /// same file rustup itself tells you to source sidesteps that regardless of the
 /// remote's shell or rc setup.
 pub fn remote_command(
-    dir: &RemoteDir,
+    dir: &str,
     local_root: &Path,
     args: &[Quoted],
     post_build: &str,
@@ -127,7 +132,7 @@ pub fn remote_command(
 
     let mut command = format!(
         ". \"$HOME/.cargo/env\" 2>/dev/null; cd {} && {remap} CARGO_TERM_COLOR=always cargo build",
-        Quoted::new(dir.as_str()).as_str()
+        Quoted::new(dir).as_str()
     );
     for arg in args {
         command.push(' ');
@@ -154,7 +159,7 @@ pub fn remote_command(
 /// connect, which is why it maps to `Unreachable` while every other status is the
 /// remote cargo's own.
 pub fn build(config: &Config, args: &[Quoted], post_build: &str) -> BuildOutcome {
-    let command = remote_command(&config.remote_dir, config.root.as_path(), args, post_build);
+    let command = remote_command(&remote_dir(config), config.root.as_path(), args, post_build);
 
     match Command::new("ssh")
         .arg(config.host.as_str())
@@ -198,7 +203,7 @@ mod tests {
     }
 
     fn args_as_strings(root: &Path, host: &str, dir: &str) -> Vec<String> {
-        rsync_args(root, host, &RemoteDir::new(dir).unwrap())
+        rsync_args(root, host, dir)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -290,7 +295,7 @@ mod tests {
         fs::write(dst.join("target").join("cached.o"), "remote cache\n").unwrap();
         fs::write(dst.join("stale.rs"), "deleted upstream\n").unwrap();
 
-        let args = rsync_args(&src, "", &RemoteDir::new("ignored").unwrap());
+        let args = rsync_args(&src, "", "ignored");
         // Swap the remote destination for a local one; every other flag is untouched.
         let mut local: Vec<OsString> = args
             .into_iter()
@@ -330,8 +335,8 @@ mod tests {
 
     #[test]
     fn remote_command_remaps_the_build_path_to_the_local_project_root() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &[], "");
 
         // $PWD is left for the remote shell to expand — it is the only way to learn
         // the host's absolute path without a second round trip to ask for it.
@@ -343,16 +348,16 @@ mod tests {
 
     #[test]
     fn remap_survives_a_project_path_containing_a_quote() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/it's"), &[], "");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/it's"), &[], "");
 
         assert!(cmd.contains(r"'/home/me/it'\''s'"), "got {cmd}");
     }
 
     #[test]
     fn remote_command_preserves_the_build_exit_code_across_the_post_build_step() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "echo split");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &[], "echo split");
 
         // rc is captured immediately after cargo and re-exited at the end, so a
         // compile failure stays a compile failure no matter what the split step does.
@@ -366,8 +371,8 @@ mod tests {
 
     #[test]
     fn remote_command_without_a_post_build_step_has_no_exit_code_plumbing() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &[], "");
 
         assert_eq!(
             cmd,
@@ -379,8 +384,8 @@ mod tests {
 
     #[test]
     fn remote_command_sources_cargo_env_before_anything_else() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &[], "");
 
         assert!(
             cmd.starts_with(". \"$HOME/.cargo/env\" 2>/dev/null; "),
@@ -390,8 +395,8 @@ mod tests {
 
     #[test]
     fn remote_command_changes_directory_and_forces_colour() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[], "");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &[], "");
 
         assert_eq!(
             cmd,
@@ -403,14 +408,14 @@ mod tests {
 
     #[test]
     fn remote_command_appends_every_forwarded_flag_quoted() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
+        let dir = ".mamba/proj";
         let args = [
             Quoted::new("--release"),
             Quoted::new("--features"),
             Quoted::new("a b"),
         ];
 
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &args, "");
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &args, "");
 
         assert_eq!(
             cmd,
@@ -422,8 +427,8 @@ mod tests {
 
     #[test]
     fn remote_command_cannot_be_hijacked_by_a_malicious_flag() {
-        let dir = RemoteDir::new(".mamba/proj").unwrap();
-        let cmd = remote_command(&dir, Path::new("/home/me/proj"), &[Quoted::new("; rm -rf ~")], "");
+        let dir = ".mamba/proj";
+        let cmd = remote_command(dir, Path::new("/home/me/proj"), &[Quoted::new("; rm -rf ~")], "");
 
         // The whole thing stays one quoted argument to cargo.
         assert!(cmd.ends_with("cargo build '; rm -rf ~'"), "got {cmd}");

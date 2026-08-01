@@ -29,26 +29,6 @@ impl Host {
     }
 }
 
-/// Where the project lands on the remote machine. A relative path is taken from the
-/// remote user's home directory, which is how the `.mamba/<name>` default resolves
-/// without ever needing a tilde. Single quotes are rejected so the value can be
-/// wrapped in them safely when it is sent to a remote shell.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteDir(String);
-
-impl RemoteDir {
-    pub fn new(raw: &str) -> Result<RemoteDir, ConfigError> {
-        if raw.is_empty() || raw.contains('\'') {
-            return Err(ConfigError::BadRemoteDir(raw.to_string()));
-        }
-        Ok(RemoteDir(raw.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// A directory that holds a `.mamba.toml`. Only [`Config::discover`] builds one, so
 /// holding a `ProjectRoot` is proof the config file was actually found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +56,10 @@ impl ProjectRoot {
 pub struct Config {
     pub root: ProjectRoot,
     pub host: Host,
-    pub remote_dir: RemoteDir,
+    /// Names this project on the far side. Derived from the directory rather than
+    /// configured — it identifies a tenant, and a developer building on their own machine
+    /// is not one.
+    pub project_id: String,
     pub pull: bool,
     pub symbols: bool,
 }
@@ -107,10 +90,7 @@ impl Config {
             .ok_or(ConfigError::MissingHost)?;
         let host = Host::new(host)?;
 
-        let remote_dir = match table.get("remote_dir").and_then(|v| v.as_str()) {
-            Some(dir) => RemoteDir::new(dir)?,
-            None => default_remote_dir(&root)?,
-        };
+        let project_id = sanitised_project_id(&root);
 
         let pull = match table.get("pull") {
             None => false,
@@ -124,18 +104,35 @@ impl Config {
                 .ok_or_else(|| ConfigError::BadSymbols(format!("{v:?}")))?,
         };
 
-        Ok(Config { root, host, remote_dir, pull, symbols })
+        Ok(Config { root, host, project_id, pull, symbols })
     }
 }
 
-/// Builds `.mamba/<project directory name>`, relative to the remote home directory.
-fn default_remote_dir(root: &ProjectRoot) -> Result<RemoteDir, ConfigError> {
-    let name = root
+/// Turns a project directory's name into something safe to send as an identifier and to
+/// use as a directory on the far side. Anything unusual becomes an underscore.
+fn sanitised_project_id(root: &ProjectRoot) -> String {
+    let raw = root
         .as_path()
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
-    RemoteDir::new(&format!(".mamba/{name}"))
+
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "project".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Every way `.mamba.toml` can be wrong.
@@ -145,7 +142,6 @@ pub enum ConfigError {
     Syntax(PathBuf, String),
     MissingHost,
     BadHost(String),
-    BadRemoteDir(String),
     BadPull(String),
     BadSymbols(String),
 }
@@ -161,7 +157,6 @@ impl fmt::Display for ConfigError {
             ConfigError::BadHost(h) => {
                 write!(f, "host {h:?} is not a plain ssh destination (letters, digits, . - _ @ only)")
             }
-            ConfigError::BadRemoteDir(d) => write!(f, "remote_dir {d:?} is empty or contains a quote"),
             ConfigError::BadPull(v) => write!(f, "pull must be true or false, got {v}"),
             ConfigError::BadSymbols(v) => write!(f, "symbols must be true or false, got {v}"),
         }
@@ -201,10 +196,37 @@ mod tests {
     }
 
     #[test]
-    fn remote_dir_rejects_empty_and_single_quote() {
-        assert!(RemoteDir::new("").is_err());
-        assert!(RemoteDir::new("a'b").is_err());
-        assert_eq!(RemoteDir::new(".mamba/x").unwrap().as_str(), ".mamba/x");
+    fn project_id_is_the_directory_name_and_is_never_configured() {
+        let parent = tmpdir("pid-derived");
+        let root = parent.join("myproject");
+        std::fs::create_dir_all(&root).unwrap();
+        // A project_id key in the file must be ignored, not honoured.
+        fs::write(
+            root.join(CONFIG_FILE),
+            "host = \"gpu-box\"\nproject_id = \"ignored\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            Config::discover(&root).unwrap().unwrap().project_id,
+            "myproject"
+        );
+    }
+
+    #[test]
+    fn a_project_id_derived_from_an_odd_directory_name_is_still_a_plain_name() {
+        let parent = tmpdir("pid-odd");
+        let root = parent.join("my project!");
+        std::fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(CONFIG_FILE), "host = \"gpu-box\"\n").unwrap();
+
+        let id = Config::discover(&root).unwrap().unwrap().project_id;
+
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
+            "a project id crosses the wire and names a directory: {id:?}"
+        );
     }
 
     #[test]
@@ -236,36 +258,12 @@ mod tests {
         assert!(Config::discover(&dir).is_none());
     }
 
-    #[test]
-    fn default_remote_dir_is_dot_mamba_plus_directory_name() {
-        let parent = tmpdir("default-dir");
-        let root = parent.join("myproject");
-        std::fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(CONFIG_FILE), "host = \"gpu-box\"\n").unwrap();
 
-        let config = Config::discover(&root).unwrap().unwrap();
-
-        assert_eq!(config.remote_dir.as_str(), ".mamba/myproject");
-    }
-
-    #[test]
-    fn explicit_remote_dir_overrides_the_default() {
-        let dir = tmpdir("explicit-dir");
-        fs::write(
-            dir.join(CONFIG_FILE),
-            "host = \"gpu-box\"\n# a comment\nremote_dir = \"builds/thing\"\n",
-        )
-        .unwrap();
-
-        let config = Config::discover(&dir).unwrap().unwrap();
-
-        assert_eq!(config.remote_dir.as_str(), "builds/thing");
-    }
 
     #[test]
     fn missing_host_is_an_error_not_a_silent_pass() {
         let dir = tmpdir("no-host");
-        fs::write(dir.join(CONFIG_FILE), "remote_dir = \"x\"\n").unwrap();
+        fs::write(dir.join(CONFIG_FILE), "pull = true\n").unwrap();
         assert!(Config::discover(&dir).unwrap().is_err());
     }
 

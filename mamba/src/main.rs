@@ -175,7 +175,6 @@ and make sure ~/.local/bin comes before ~/.cargo/bin on your PATH.
 
 Then, in any project you want built remotely, create .mamba.toml:
     host = \"gpu-box\"            # any ssh destination or ~/.ssh/config alias
-    # remote_dir = \".mamba/proj\"  # optional, relative to the remote home directory
 
 From then on `cargo build` in that project compiles on gpu-box.
     cargo build --mamba-pull      fetch the built binary back
