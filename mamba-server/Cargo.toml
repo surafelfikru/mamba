@@ -1,0 +1,4 @@
+[package]
+name = "mamba-server"
+version.workspace = true
+edition.workspace = true

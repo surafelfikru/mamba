@@ -1,0 +1,7 @@
+[package]
+name = "mamba"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }

@@ -1,7 +1,17 @@
-[package]
-name = "mamba"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["mamba", "mamba-core", "mamba-server"]
 
-[dependencies]
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+prost = "0.14.4"
+tonic-prost-build = "0.14.6"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time", "sync"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
