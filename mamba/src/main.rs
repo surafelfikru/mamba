@@ -1,9 +1,8 @@
 mod channel;
 mod config;
-mod remote;
+mod ssh;
 
 use config::Config;
-use remote::{BuildOutcome, Quoted};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
@@ -53,24 +52,9 @@ fn main() -> ExitCode {
         Some(Ok(config)) => config,
     };
 
-    let project = project_name(&config);
-
-    status("Syncing", &format!("{project} to {}", config.host.as_str()));
-    if let Err(e) = remote::sync(&config) {
-        return offer_local_build(&config, &args, &e);
-    }
-
-    let flags: Vec<Quoted> = args[1..].iter().map(|a| Quoted::new(a)).collect();
-
-    // Artifact fetching is being rebuilt on the daemon; the post-build split moves to
-    // whichever side ran the build.
-    let post_build = String::new();
-    let outcome = remote::build(&config, &flags, &post_build);
-
-    match outcome {
-        BuildOutcome::Finished(code) => ExitCode::from(code.clamp(0, 255) as u8),
-        BuildOutcome::Unreachable(why) => offer_local_build(&config, &args, &why),
-    }
+    let _ = &config;
+    // Rebuilt on the daemon in a later task.
+    return ExitCode::from(0);
 }
 
 /// Tells the user the remote is down and asks whether to fall back to a local build.
