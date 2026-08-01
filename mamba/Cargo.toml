@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+toml.workspace = true
+mamba-core = { path = "../mamba-core" }
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+async-trait.workspace = true
