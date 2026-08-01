@@ -14,6 +14,7 @@ use mamba_core::layout;
 use mamba_core::proto::artifact_request::Kind;
 use mamba_core::proto::{build_event, BuildEvent, TransferTarget};
 use std::path::Path;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -75,33 +76,48 @@ fn build_command(remote_dir: &str, local_root: &str, args: &[String]) -> String 
 /// Talks to an ordinary ssh host, with no Mamba software installed on it.
 pub struct SshControlChannel {
     host: String,
-    /// The last build's arguments and the client's project root, so a later artifact
-    /// request resolves against the same profile the build used. The gRPC server keeps
-    /// the same memory for the same reason.
-    last: Mutex<(Vec<String>, String)>,
+    /// Each project's most recent build — its arguments and the client's project root —
+    /// so a later artifact request resolves against the profile that build used. Keyed by
+    /// project because one channel instance is shared by every project building against
+    /// this host, concurrently; a single slot here let interleaved builds overwrite each
+    /// other's memory. The gRPC server keeps per-project args for the same reason, though
+    /// not the root — the server reads Cargo.toml from its own disk, this channel reads
+    /// the client's.
+    last: Mutex<HashMap<String, (Vec<String>, String)>>,
 }
 
 impl SshControlChannel {
     pub fn new(host: &str) -> SshControlChannel {
         SshControlChannel {
             host: host.to_string(),
-            last: Mutex::new((Vec::new(), String::new())),
+            last: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Records what the most recent build was, for artifact resolution afterwards.
-    pub fn remember(&self, args: &[String], local_root: &str) {
+    /// Records what a project's most recent build was, for artifact resolution afterwards.
+    pub fn remember(&self, project_id: &str, args: &[String], local_root: &str) {
         if let Ok(mut last) = self.last.lock() {
-            *last = (args.to_vec(), local_root.to_string());
+            last.insert(
+                project_id.to_string(),
+                (args.to_vec(), local_root.to_string()),
+            );
         }
     }
 
-    fn last_args(&self) -> Vec<String> {
-        self.last.lock().map(|l| l.0.clone()).unwrap_or_default()
+    fn last_args(&self, project_id: &str) -> Vec<String> {
+        self.last
+            .lock()
+            .ok()
+            .and_then(|l| l.get(project_id).map(|(args, _)| args.clone()))
+            .unwrap_or_default()
     }
 
-    fn last_root(&self) -> String {
-        self.last.lock().map(|l| l.1.clone()).unwrap_or_default()
+    fn last_root(&self, project_id: &str) -> String {
+        self.last
+            .lock()
+            .ok()
+            .and_then(|l| l.get(project_id).map(|(_, root)| root.clone()))
+            .unwrap_or_default()
     }
 
     /// Where a project lives on the far side. Relative paths are taken from the remote
@@ -135,7 +151,7 @@ impl ControlChannel for SshControlChannel {
         args: &[String],
         local_root: &str,
     ) -> Result<BuildStream, ChannelError> {
-        self.remember(args, local_root);
+        self.remember(project_id, args, local_root);
 
         let command = build_command(&self.remote_dir(project_id), local_root, args);
         let mut child = tokio::process::Command::new("ssh")
@@ -219,7 +235,7 @@ impl ControlChannel for SshControlChannel {
         kind: Kind,
     ) -> Result<TransferTarget, ChannelError> {
         let dir = self.remote_dir(project_id);
-        let args = self.last_args();
+        let args = self.last_args(project_id);
         let subdir = layout::target_subdir(&args);
 
         let (remote_rel, local_rel) = match kind {
@@ -232,7 +248,7 @@ impl ControlChannel for SshControlChannel {
                 (p.clone(), p)
             }
             Kind::Binary => {
-                let root = self.last_root();
+                let root = self.last_root(project_id);
                 let name = layout::binary_name(Path::new(&root)).map_err(ChannelError)?;
 
                 // The split runs where the binary is, using CPU already paid for.
@@ -259,7 +275,7 @@ impl ControlChannel for SshControlChannel {
                 )
             }
             Kind::Symbols => {
-                let root = self.last_root();
+                let root = self.last_root(project_id);
                 let name = layout::binary_name(Path::new(&root)).map_err(ChannelError)?;
                 let p = format!("target/{subdir}/{name}.debug");
                 (p.clone(), p)
@@ -314,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_paths_follow_the_profile_of_the_last_build() {
         let ssh = SshControlChannel::new("gpu-box");
-        ssh.remember(&["--release".to_string()], "/home/dev/proj");
+        ssh.remember("myproj", &["--release".to_string()], "/home/dev/proj");
 
         let t = ssh
             .request_artifact("myproj", Kind::ProcMacros)
@@ -323,6 +339,22 @@ mod tests {
 
         assert_eq!(t.relative_path, "target/release/deps");
         assert_eq!(t.path, ".mamba/myproj/target/release/deps");
+    }
+
+    #[tokio::test]
+    async fn two_projects_on_one_channel_keep_their_own_build_memory() {
+        // The daemon caches one channel per host and serves builds concurrently, so two
+        // projects interleave on the same channel instance. Project B building must not
+        // make project A's artifact request resolve with B's profile.
+        let ssh = SshControlChannel::new("gpu-box");
+        ssh.remember("proj-a", &["--release".to_string()], "/home/dev/a");
+        ssh.remember("proj-b", &[], "/home/dev/b");
+
+        let a = ssh.request_artifact("proj-a", Kind::ProcMacros).await.unwrap();
+        let b = ssh.request_artifact("proj-b", Kind::ProcMacros).await.unwrap();
+
+        assert_eq!(a.relative_path, "target/release/deps", "A built --release");
+        assert_eq!(b.relative_path, "target/debug/deps", "B built plain debug");
     }
 
     #[test]
