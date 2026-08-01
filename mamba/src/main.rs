@@ -1,6 +1,7 @@
 mod channel;
 mod config;
 mod grpc;
+mod ipc;
 mod ssh;
 mod transfer;
 
