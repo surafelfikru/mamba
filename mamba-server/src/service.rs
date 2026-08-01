@@ -6,11 +6,18 @@
 
 use mamba_core::layout;
 use mamba_core::proto::artifact_request::Kind;
-use mamba_core::proto::TransferTarget;
+use mamba_core::proto::control_server::Control;
+use mamba_core::proto::{
+    build_event, ArtifactRequest, BuildEvent, BuildRequest, TransferTarget, UploadRequest,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 /// Serves one directory of projects, advertising itself under a fixed host and user.
 ///
@@ -125,6 +132,122 @@ impl ControlService {
             path: dir.join(&remote_rel).display().to_string(),
             relative_path: local_rel,
         })
+    }
+}
+
+#[tonic::async_trait]
+impl Control for ControlService {
+    async fn request_upload(
+        &self,
+        request: Request<UploadRequest>,
+    ) -> Result<Response<TransferTarget>, Status> {
+        self.upload_target(&request.into_inner().project_id)
+            .map(Response::new)
+            .map_err(Status::invalid_argument)
+    }
+
+    async fn request_artifact(
+        &self,
+        request: Request<ArtifactRequest>,
+    ) -> Result<Response<TransferTarget>, Status> {
+        let req = request.into_inner();
+        let kind = Kind::try_from(req.kind)
+            .map_err(|_| Status::invalid_argument(format!("unknown artifact kind {}", req.kind)))?;
+
+        // The profile is remembered from the build that produced the artifact rather than
+        // resent, so a client cannot ask for one profile's binary after building another.
+        let args = self.last_args(&req.project_id);
+
+        self.resolve_artifact(&req.project_id, kind, &args)
+            .map(Response::new)
+            .map_err(Status::failed_precondition)
+    }
+
+    type StartBuildStream = ReceiverStream<Result<BuildEvent, Status>>;
+
+    /// Runs cargo and pushes its output back a line at a time, ending with the exit code.
+    ///
+    /// `--remap-path-prefix` rewrites the compiler's record of where it ran to the
+    /// client's own project path, so a debugger on the far end finds source files instead
+    /// of paths that exist only here.
+    async fn start_build(
+        &self,
+        request: Request<BuildRequest>,
+    ) -> Result<Response<Self::StartBuildStream>, Status> {
+        let req = request.into_inner();
+        let dir = self
+            .project_dir(&req.project_id)
+            .map_err(Status::invalid_argument)?;
+
+        self.remember_args(&req.project_id, &req.args);
+
+        let mut child = tokio::process::Command::new("cargo")
+            .arg("build")
+            .args(&req.args)
+            .current_dir(&dir)
+            .env("CARGO_TERM_COLOR", "always")
+            .env(
+                "RUSTFLAGS",
+                format!("--remap-path-prefix={}={}", dir.display(), req.local_root),
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Status::internal(format!("could not start cargo: {e}")))?;
+
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            let out_tx = tx.clone();
+            let out = tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let payload = build_event::Payload::Stdout(format!("{line}\n").into_bytes());
+                    if out_tx
+                        .send(Ok(BuildEvent {
+                            payload: Some(payload),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let err_tx = tx.clone();
+            let err = tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let payload = build_event::Payload::Stderr(format!("{line}\n").into_bytes());
+                    if err_tx
+                        .send(Ok(BuildEvent {
+                            payload: Some(payload),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let _ = tokio::join!(out, err);
+
+            let code = match child.wait().await {
+                Ok(status) => status.code().unwrap_or(130),
+                Err(_) => 1,
+            };
+            let _ = tx
+                .send(Ok(BuildEvent {
+                    payload: Some(build_event::Payload::ExitCode(code)),
+                }))
+                .await;
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -247,5 +370,46 @@ mod tests {
 
         assert!(root.join("fresh").is_dir());
         assert_eq!(t.path, root.join("fresh").display().to_string());
+    }
+
+    #[tokio::test]
+    async fn a_failing_build_streams_diagnostics_and_reports_cargos_own_exit_code() {
+        use mamba_core::proto::build_event::Payload;
+        use mamba_core::proto::control_server::Control;
+        use tokio_stream::StreamExt;
+
+        let root = tmpdir("svc-build");
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("src")).unwrap();
+        fs::write(
+            proj.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(proj.join("src/main.rs"), "fn main() { this is not rust }").unwrap();
+
+        let svc = service(&root);
+        let stream = svc
+            .start_build(tonic::Request::new(mamba_core::proto::BuildRequest {
+                project_id: "proj".to_string(),
+                args: vec![],
+                local_root: proj.display().to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let mut stream = stream.into_inner();
+        let mut saw_output = false;
+        let mut exit = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap().payload {
+                Some(Payload::Stderr(b)) if !b.is_empty() => saw_output = true,
+                Some(Payload::ExitCode(c)) => exit = Some(c),
+                _ => {}
+            }
+        }
+
+        assert!(saw_output, "a failing build must report diagnostics");
+        assert_eq!(exit, Some(101), "cargo reports a compile error as 101");
     }
 }
