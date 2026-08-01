@@ -185,6 +185,7 @@ impl Control for ControlService {
             .arg("build")
             .args(&req.args)
             .current_dir(&dir)
+            .env("PATH", cargo_path())
             .env("CARGO_TERM_COLOR", "always")
             .env(
                 "RUSTFLAGS",
@@ -248,6 +249,25 @@ impl Control for ControlService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// `PATH` with rustup's directory on the front, so cargo is findable however the server
+/// was started.
+///
+/// A server launched from a login shell inherits a usable `PATH`, but one started
+/// detached over ssh or by a service manager does not — rustup wires `~/.cargo/bin` in
+/// from interactive rc files only. Without this the build fails with a bare "No such file
+/// or directory" that says nothing about which file. The ssh transport solves the same
+/// problem by sourcing `~/.cargo/env`; this is that fix on the other side.
+fn cargo_path() -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    match std::env::var_os("HOME") {
+        Some(home) => {
+            let bin = PathBuf::from(home).join(".cargo/bin");
+            format!("{}:{inherited}", bin.display())
+        }
+        None => inherited,
     }
 }
 
@@ -361,6 +381,19 @@ mod tests {
 
         assert!(t.path.ends_with("target/debug/app.debug"), "got {}", t.path);
         assert_eq!(t.relative_path, "target/debug/app.debug");
+    }
+
+    #[test]
+    fn the_build_path_puts_rustups_directory_ahead_of_whatever_was_inherited() {
+        let path = cargo_path();
+
+        assert!(
+            path.starts_with(&format!(
+                "{}/.cargo/bin:",
+                std::env::var("HOME").unwrap()
+            )),
+            "a server started detached has no cargo on PATH: {path}"
+        );
     }
 
     #[test]
