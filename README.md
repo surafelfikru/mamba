@@ -66,7 +66,7 @@ Create `.mamba.toml` in any project you want built remotely:
 ```toml
 host = "gpu-box"              # any ssh destination, or an alias from ~/.ssh/config
 pull = false                  # optional; fetch the built binary after a successful build
-symbols = false               # optional; also fetch its debug symbols
+pull-symbols = false          # optional; also fetch its debug symbols
 ```
 
 `host` is the only setting that names the build machine. Where the project lands over
@@ -90,16 +90,20 @@ built binary to the exact local path cargo would have used (`target/debug/yourbi
 `target/release/yourbin`), either pass a flag or set it in the config:
 
 ```sh
-cargo build --mamba-pull        # this build only
-cargo build --mamba-symbols     # also fetch debug symbols (implies --mamba-pull)
+cargo build --mamba-pull            # this build only
+cargo build --mamba-pull-symbols    # also fetch debug symbols (implies pull)
 ```
 
 ```toml
 pull = true                     # every build in this project
-symbols = true                  # and always fetch symbols too
+pull-symbols = true             # symbols too — and, again, implies pull
 ```
 
-The flag always wins if both are set. It's prefixed `--mamba-pull` rather than `--pull`
+Asking for symbols asks for the binary as well, in either place: the stripped binary
+carries the link a debugger follows to find them, so one without the other is no use.
+The two sources add up rather than override — a switch is on if either turns it on, which
+is what makes a flag win over a config file that left it off. It's prefixed `--mamba-pull`
+rather than `--pull`
 so it can never collide with a real (current or future) cargo flag — Mamba strips it
 before anything reaches cargo, local or remote. Only the crate's default binary (the one
 matching `[package] name` under `src/main.rs`) is resolved; a workspace or an explicit
@@ -121,7 +125,7 @@ Build artifacts stay on the remote machine unless you opt into pulling them (abo
 
 The binary you get is stripped of debug info, which makes it roughly four times
 smaller to transfer. Panic backtraces still show function names. For line numbers
-and source-level debugging, add `--mamba-symbols` to fetch the symbol file — your
+and source-level debugging, add `--mamba-pull-symbols` to fetch the symbol file — your
 debugger picks it up automatically once it is there.
 
 If the remote is unreachable, Mamba asks whether to build locally instead. With no

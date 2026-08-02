@@ -1,12 +1,12 @@
 mod channel;
-mod config;
 mod daemon;
 mod grpc;
+mod input;
 mod ipc;
 mod ssh;
 mod transfer;
 
-use config::Config;
+use input::{Invocation, Plan, SETTINGS};
 use std::ffi::OsStr;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
@@ -34,57 +34,39 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // `--mamba-pull` is Mamba's own flag, not cargo's — strip it here, once, so it can
-    // never reach a real cargo invocation, local or remote.
-    let cli_symbols = argv[1..].iter().any(|a| a == "--mamba-symbols");
-    let cli_pull = argv[1..].iter().any(|a| a == "--mamba-pull") || cli_symbols;
-    let args: Vec<String> = argv[1..]
-        .iter()
-        .filter(|a| a.as_str() != "--mamba-pull" && a.as_str() != "--mamba-symbols")
-        .cloned()
-        .collect();
+    // A working directory that no longer exists cannot hold a project, and an empty path
+    // finds none — which is the same answer, reached without a branch of its own.
+    let cwd = std::env::current_dir().unwrap_or_default();
 
-    // Only `build` goes remote. Everything else is cargo's business.
-    if args.first().map(String::as_str) != Some("build") {
-        return exec_real_cargo(&args);
-    }
-
-    let Ok(cwd) = std::env::current_dir() else {
-        return exec_real_cargo(&args);
-    };
-
-    let config = match Config::discover(&cwd) {
-        None => return exec_real_cargo(&args),
-        Some(Err(e)) => {
+    match input::plan(&cwd, &argv[1..]) {
+        Plan::Local(args) => exec_real_cargo(&args),
+        Plan::Broken(e) => {
             eprintln!("mamba: {e}");
-            return ExitCode::from(1);
+            ExitCode::from(1)
         }
-        Some(Ok(config)) => config,
-    };
+        Plan::Remote(invocation) => build_remotely(&invocation),
+    }
+}
 
-    let request = ipc::Request {
-        // Cargo's own flags, without the `build` subcommand the shim matched on.
-        args: args[1..].to_vec(),
-        root: config.root.as_path().display().to_string(),
-        host: config.host.as_str().to_string(),
-        project_id: config.project_id.clone(),
-        pull: cli_pull || config.pull,
-        symbols: cli_symbols || config.symbols,
-    };
-
+/// Hands one build to the daemon and relays what comes back.
+///
+/// Every way this can go wrong — no daemon, a broken pipe, a daemon that says nothing —
+/// ends the same way: the user is offered the local build they would have got without
+/// Mamba installed.
+fn build_remotely(invocation: &Invocation) -> ExitCode {
     let mut stream = match connect_or_spawn_daemon() {
         Ok(s) => s,
-        Err(e) => return offer_local_build(&config, &args, &e),
+        Err(e) => return offer_local_build(invocation, &e),
     };
 
-    if let Err(e) = ipc::write_request(&mut stream, &request) {
-        return offer_local_build(&config, &args, &format!("could not send the request: {e}"));
+    if let Err(e) = ipc::write_invocation(&mut stream, invocation) {
+        return offer_local_build(invocation, &format!("could not send the request: {e}"));
     }
 
     match relay_frames(&mut stream) {
         Ok(Some(code)) => ExitCode::from(code.clamp(0, 255) as u8),
-        Ok(None) => offer_local_build(&config, &args, "the daemon closed without answering"),
-        Err(why) => offer_local_build(&config, &args, &why),
+        Ok(None) => offer_local_build(invocation, "the daemon closed without answering"),
+        Err(why) => offer_local_build(invocation, &why),
     }
 }
 
@@ -157,12 +139,13 @@ fn relay_frames(stream: &mut std::os::unix::net::UnixStream) -> Result<Option<i3
 /// When there is no terminal to ask on — inside `make`, a build script, or an editor's
 /// background check — it falls back without asking, because failing there would break
 /// tooling that has nothing to do with Mamba.
-fn offer_local_build(config: &Config, args: &[String], why: &str) -> ExitCode {
-    eprintln!("mamba: {} unreachable ({why})", config.host.as_str());
+fn offer_local_build(invocation: &Invocation, why: &str) -> ExitCode {
+    let args = invocation.local_argv();
+    eprintln!("mamba: {} unreachable ({why})", invocation.host.as_str());
 
     if !io::stdin().is_terminal() {
         eprintln!("mamba: no terminal to ask on, building locally");
-        return exec_real_cargo(args);
+        return exec_real_cargo(&args);
     }
 
     eprint!("mamba: build locally instead? [Y/n] ");
@@ -170,12 +153,12 @@ fn offer_local_build(config: &Config, args: &[String], why: &str) -> ExitCode {
 
     let mut answer = String::new();
     match io::stdin().read_line(&mut answer) {
-        Ok(0) | Err(_) => return exec_real_cargo(args),
+        Ok(0) | Err(_) => return exec_real_cargo(&args),
         Ok(_) => {}
     }
 
     if answer_means_yes(&answer) {
-        exec_real_cargo(args)
+        exec_real_cargo(&args)
     } else {
         ExitCode::from(1)
     }
@@ -217,7 +200,16 @@ fn status(verb: &str, message: &str) {
 }
 
 /// Explains how to install the shim, shown when the binary is run as `mamba`.
+///
+/// The switches are listed straight from [`SETTINGS`], so the help can never drift from
+/// what the flags actually are.
 fn print_usage() {
+    let width = SETTINGS.iter().map(|s| s.flag.len()).max().unwrap_or(0);
+    let switches: String = SETTINGS
+        .iter()
+        .map(|s| format!("    cargo build {:width$} {}\n", s.flag, s.help))
+        .collect();
+
     eprintln!(
         "\
 Mamba(🐍) builds your Rust project on another machine.
@@ -230,8 +222,8 @@ Then, in any project you want built remotely, create .mamba.toml:
     host = \"gpu-box\"            # any ssh destination or ~/.ssh/config alias
 
 From then on `cargo build` in that project compiles on gpu-box.
-    cargo build --mamba-pull      fetch the built binary back
-    cargo build --mamba-symbols   also fetch debug symbols for it
+{switches}\
+Any switch above can be set for good in .mamba.toml instead, as `pull = true`.
 Every other cargo command runs locally as usual."
     );
 }

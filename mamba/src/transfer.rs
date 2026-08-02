@@ -8,8 +8,8 @@
 //! All transfers share one multiplexed ssh connection, turning a per-command handshake
 //! into a one-time cost.
 
-use mamba_core::proto::artifact_request::Kind;
 use mamba_core::proto::TransferTarget;
+use mamba_core::proto::artifact_request::Kind;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,12 +25,11 @@ use std::process::Command;
 /// it is what ssh does anyway, and forcing `-p 22` would clobber a port set for this host
 /// in `~/.ssh/config`.
 pub fn ssh_control_args(port: u32) -> Vec<OsString> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let control_path = format!("{home}/.mamba/cm-%C");
+    let control_path = crate::input::mamba_home().join("cm-%C");
+    let control_path = control_path.display();
 
-    let mut ssh = format!(
-        "ssh -o ControlMaster=auto -o ControlPath={control_path} -o ControlPersist=600"
-    );
+    let mut ssh =
+        format!("ssh -o ControlMaster=auto -o ControlPath={control_path} -o ControlPersist=600");
     if port != 0 && port != 22 {
         ssh.push_str(&format!(" -p {port}"));
     }
@@ -40,9 +39,7 @@ pub fn ssh_control_args(port: u32) -> Vec<OsString> {
 
 /// Makes sure the directory holding multiplexing sockets exists.
 fn ensure_control_dir() {
-    if let Ok(home) = std::env::var("HOME") {
-        let _ = std::fs::create_dir_all(PathBuf::from(home).join(".mamba"));
-    }
+    let _ = std::fs::create_dir_all(crate::input::mamba_home());
 }
 
 /// Renders the remote side of an rsync command line. An empty user means the ssh config
@@ -219,13 +216,19 @@ mod tests {
         // The property that keeps the client topology-agnostic: whatever the far side
         // says, the client uses. It must never substitute the host it was configured with.
         let root = std::path::Path::new("/home/dev/proj");
-        let t = target("some-other-worker", "/elsewhere/app.slim", "target/debug/app");
+        let t = target(
+            "some-other-worker",
+            "/elsewhere/app.slim",
+            "target/debug/app",
+        );
 
         let (args, _) = fetch_args(root, &t, Kind::Binary);
 
-        assert!(strings(&args)
-            .iter()
-            .any(|a| a.contains("some-other-worker")));
+        assert!(
+            strings(&args)
+                .iter()
+                .any(|a| a.contains("some-other-worker"))
+        );
     }
 
     #[test]

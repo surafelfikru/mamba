@@ -4,23 +4,13 @@
 //! on every cargo invocation on the machine, so it stays free of serialization crates and
 //! async runtimes — the few dozen lines here are cheaper than the dependency.
 //!
-//! A request travels one way. Frames travel back until a [`Frame::Exit`], which always
-//! ends the conversation.
+//! An [`Invocation`] travels one way — this module only carries it, [`crate::input`]
+//! decides what is in it. Frames travel back until a [`Frame::Exit`], which always ends
+//! the conversation.
 
+use crate::input::{Host, Invocation, ProjectId, ProjectRoot, Settings};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-
-/// Everything the daemon needs to run one build.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
-    /// Cargo's own arguments, without the `build` subcommand.
-    pub args: Vec<String>,
-    pub root: String,
-    pub host: String,
-    pub project_id: String,
-    pub pull: bool,
-    pub symbols: bool,
-}
 
 /// One message from the daemon back to the shim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +27,7 @@ pub enum Frame {
 
 /// Where the daemon listens.
 pub fn socket_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".mamba").join("daemon.sock")
+    crate::input::mamba_home().join("daemon.sock")
 }
 
 fn write_bytes(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
@@ -58,41 +47,47 @@ fn read_string(input: &mut impl Read) -> io::Result<String> {
     String::from_utf8(read_bytes(input)?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-pub fn write_request(out: &mut impl Write, request: &Request) -> io::Result<()> {
-    out.write_all(&(request.args.len() as u32).to_be_bytes())?;
-    for arg in &request.args {
-        write_bytes(out, arg.as_bytes())?;
+pub fn write_invocation(out: &mut impl Write, invocation: &Invocation) -> io::Result<()> {
+    out.write_all(&(invocation.flags.len() as u32).to_be_bytes())?;
+    for flag in &invocation.flags {
+        write_bytes(out, flag.as_bytes())?;
     }
-    write_bytes(out, request.root.as_bytes())?;
-    write_bytes(out, request.host.as_bytes())?;
-    write_bytes(out, request.project_id.as_bytes())?;
-    out.write_all(&[u8::from(request.pull) | (u8::from(request.symbols) << 1)])?;
+    write_bytes(out, invocation.root.as_path().to_string_lossy().as_bytes())?;
+    write_bytes(out, invocation.host.as_str().as_bytes())?;
+    write_bytes(out, invocation.project_id.as_str().as_bytes())?;
+    out.write_all(&[invocation.settings.bits()])?;
     out.flush()
 }
 
-pub fn read_request(input: &mut impl Read) -> io::Result<Request> {
+/// Reads one invocation back, putting every value through the type that guards it.
+///
+/// The socket is one any process running as this user can open, and the host and project
+/// id it carries go on to be pasted into ssh command lines. Rebuilding them through
+/// [`Host::new`] and [`ProjectId::new`] rather than taking the strings as they arrive
+/// makes this the last place that has to be checked, instead of every place they are used.
+pub fn read_invocation(input: &mut impl Read) -> io::Result<Invocation> {
     let mut count = [0u8; 4];
     input.read_exact(&mut count)?;
 
-    let mut args = Vec::new();
+    let mut flags = Vec::new();
     for _ in 0..u32::from_be_bytes(count) {
-        args.push(read_string(input)?);
+        flags.push(read_string(input)?);
     }
 
-    let root = read_string(input)?;
-    let host = read_string(input)?;
-    let project_id = read_string(input)?;
+    let root = ProjectRoot::new(PathBuf::from(read_string(input)?));
+    let host = Host::new(&read_string(input)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let project_id = ProjectId::new(&read_string(input)?);
 
-    let mut flags = [0u8; 1];
-    input.read_exact(&mut flags)?;
+    let mut bits = [0u8; 1];
+    input.read_exact(&mut bits)?;
 
-    Ok(Request {
-        args,
+    Ok(Invocation {
         root,
         host,
         project_id,
-        pull: flags[0] & 1 != 0,
-        symbols: flags[0] & 2 != 0,
+        settings: Settings::from_bits(bits[0]),
+        flags,
     })
 }
 
@@ -146,7 +141,7 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame tag {other}"),
-            ))
+            ));
         }
     };
     Ok(Some(frame))
@@ -156,25 +151,69 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_request_survives_the_round_trip() {
-        let original = Request {
-            args: vec![
+    use crate::input::{PULL, SYMBOLS};
+
+    /// The settings a command line asking for these flags would produce.
+    fn asked_for(flags: &[&str]) -> Settings {
+        Settings::from_flags(&flags.iter().map(|f| f.to_string()).collect::<Vec<_>>())
+    }
+
+    fn invocation() -> Invocation {
+        Invocation {
+            root: ProjectRoot::new(PathBuf::from("/home/dev/my proj")),
+            host: Host::new("gpu-box").unwrap(),
+            project_id: ProjectId::new("myproj"),
+            settings: asked_for(&["--mamba-pull"]),
+            flags: vec![
                 "--release".to_string(),
                 "--features".to_string(),
                 "a b".to_string(),
             ],
-            root: "/home/dev/my proj".to_string(),
-            host: "gpu-box".to_string(),
-            project_id: "myproj".to_string(),
-            pull: true,
-            symbols: false,
-        };
+        }
+    }
+
+    #[test]
+    fn an_invocation_survives_the_round_trip() {
+        let original = invocation();
 
         let mut buffer = Vec::new();
-        write_request(&mut buffer, &original).unwrap();
+        write_invocation(&mut buffer, &original).unwrap();
 
-        assert_eq!(read_request(&mut buffer.as_slice()).unwrap(), original);
+        assert_eq!(read_invocation(&mut buffer.as_slice()).unwrap(), original);
+    }
+
+    #[test]
+    fn a_host_that_a_shell_could_reinterpret_is_refused_on_the_way_in() {
+        // Any process running as this user can write to the socket, and whatever arrives
+        // here is pasted onto an ssh command line. The wire is where that gets checked.
+        let mut buffer = Vec::new();
+        write_invocation(&mut buffer, &invocation()).unwrap();
+
+        // Overwrite the host with a shell injection of the same length.
+        let hostile = b"gpu;id!";
+        let at = buffer
+            .windows(hostile.len())
+            .position(|w| w == b"gpu-box")
+            .expect("the host is in there");
+        buffer[at..at + hostile.len()].copy_from_slice(hostile);
+
+        assert!(read_invocation(&mut buffer.as_slice()).is_err());
+    }
+
+    #[test]
+    fn the_settings_byte_is_read_back_as_the_same_set() {
+        let mut original = invocation();
+        original.settings = asked_for(&["--mamba-pull-symbols"]);
+
+        let mut buffer = Vec::new();
+        write_invocation(&mut buffer, &original).unwrap();
+        let read = read_invocation(&mut buffer.as_slice()).unwrap();
+
+        assert!(read.settings.has(SYMBOLS));
+        assert!(
+            read.settings.has(PULL),
+            "symbols carry the binary with them"
+        );
     }
 
     #[test]
@@ -211,17 +250,16 @@ mod tests {
             Frame::Stdout(Vec::new())
         );
 
-        let request = Request {
-            args: Vec::new(),
-            root: String::new(),
-            host: String::new(),
-            project_id: String::new(),
-            pull: false,
-            symbols: false,
-        };
+        let mut bare = invocation();
+        bare.flags = Vec::new();
         let mut buffer = Vec::new();
-        write_request(&mut buffer, &request).unwrap();
-        assert!(read_request(&mut buffer.as_slice()).unwrap().args.is_empty());
+        write_invocation(&mut buffer, &bare).unwrap();
+        assert!(
+            read_invocation(&mut buffer.as_slice())
+                .unwrap()
+                .flags
+                .is_empty()
+        );
     }
 
     #[test]

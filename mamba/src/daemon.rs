@@ -9,14 +9,14 @@
 
 use crate::channel::{ChannelError, ControlChannel};
 use crate::grpc::{GRPC_PORT, GrpcControlChannel};
-use crate::ipc::{self, Frame, Request};
+use crate::input::{Invocation, PULL, SYMBOLS};
+use crate::ipc::{self, Frame};
 use crate::ssh::SshControlChannel;
 use crate::transfer;
 use mamba_core::proto::artifact_request::Kind;
 use mamba_core::proto::build_event;
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{UnixListener, UnixStream};
@@ -120,15 +120,17 @@ async fn open_channel(host: &str) -> (Arc<dyn ControlChannel>, &'static str) {
 /// exists. Callers outside tests should pass that constant; tests pass a short duration so
 /// proving a hang is fixed doesn't cost the test suite the length of the real timeout.
 pub async fn handle(
-    request: &Request,
+    invocation: &Invocation,
     channel: &dyn ControlChannel,
     out: &mut impl Write,
     transport: &str,
     rpc_timeout: Duration,
 ) -> io::Result<()> {
-    let root = Path::new(&request.root);
+    let root = invocation.root.as_path();
+    let local_root = root.to_string_lossy();
+    let project_id = invocation.project_id.as_str();
 
-    let upload = match bounded(rpc_timeout, channel.request_upload(&request.project_id)).await {
+    let upload = match bounded(rpc_timeout, channel.request_upload(project_id)).await {
         Ok(t) => t,
         Err(e) => return ipc::write_frame(out, &Frame::Failed(e.to_string())),
     };
@@ -137,7 +139,7 @@ pub async fn handle(
         out,
         &Frame::Status(
             "Syncing".to_string(),
-            format!("{} to {} via {transport}", request.project_id, upload.host),
+            format!("{project_id} to {} via {transport}", upload.host),
         ),
     )?;
     if let Err(e) = transfer::push(root, &upload) {
@@ -146,7 +148,7 @@ pub async fn handle(
 
     let mut stream = match bounded(
         rpc_timeout,
-        channel.start_build(&request.project_id, &request.args, &request.root),
+        channel.start_build(project_id, &invocation.flags, &local_root),
     )
     .await
     {
@@ -169,17 +171,17 @@ pub async fn handle(
 
     if exit == 0 {
         let mut wanted = vec![Kind::ProcMacros, Kind::GeneratedSource];
-        if request.pull {
+        if invocation.settings.has(PULL) {
             wanted.push(Kind::Binary);
         }
-        if request.symbols {
+        if invocation.settings.has(SYMBOLS) {
             wanted.push(Kind::Symbols);
         }
 
         for kind in wanted {
             // A failed fetch is reported and forgotten. The build already succeeded, and
             // its exit code is the answer the caller asked for.
-            match bounded(rpc_timeout, channel.request_artifact(&request.project_id, kind)).await {
+            match bounded(rpc_timeout, channel.request_artifact(project_id, kind)).await {
                 Err(e) => {
                     ipc::write_frame(out, &Frame::Stderr(format!("mamba: {e}\n").into_bytes()))?
                 }
@@ -271,38 +273,46 @@ async fn serve_one(
     let stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
     let mut reader = stream.try_clone()?;
-    let request = ipc::read_request(&mut reader)?;
+    let invocation = ipc::read_invocation(&mut reader)?;
     let mut writer = stream;
 
-    let cached = cache.lock().await.get(&request.host);
+    let host = invocation.host.as_str();
+    let cached = cache.lock().await.get(host);
     let (channel, transport) = match cached {
         Some(pair) => pair,
         None => {
-            let (channel, transport) = open_channel(&request.host).await;
+            let (channel, transport) = open_channel(host).await;
             cache
                 .lock()
                 .await
-                .insert(&request.host, Arc::clone(&channel), transport);
+                .insert(host, Arc::clone(&channel), transport);
             (channel, transport)
         }
     };
 
-    handle(&request, channel.as_ref(), &mut writer, transport, RPC_TIMEOUT).await
+    handle(
+        &invocation,
+        channel.as_ref(),
+        &mut writer,
+        transport,
+        RPC_TIMEOUT,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::channel::MockChannel;
+    use crate::input::{Host, ProjectId, ProjectRoot, Settings};
 
-    fn request(pull: bool) -> Request {
-        Request {
-            args: Vec::new(),
-            root: "/tmp/does-not-matter".to_string(),
-            host: "gpu-box".to_string(),
-            project_id: "proj".to_string(),
-            pull,
-            symbols: false,
+    fn invocation(settings: Settings) -> Invocation {
+        Invocation {
+            root: ProjectRoot::new(std::path::PathBuf::from("/tmp/does-not-matter")),
+            host: Host::new("gpu-box").unwrap(),
+            project_id: ProjectId::new("proj"),
+            settings,
+            flags: Vec::new(),
         }
     }
 
@@ -323,7 +333,7 @@ mod tests {
         // mitigation for a probe that silently falls back — without it, a server merely
         // being down is invisible.
         handle(
-            &request(false),
+            &invocation(Settings::default()),
             &MockChannel::new("worker-7"),
             &mut out,
             "mock",
@@ -392,7 +402,7 @@ mod tests {
         // A short bound here proves the mechanism works without the test itself waiting
         // out the real RPC_TIMEOUT.
         handle(
-            &request(false),
+            &invocation(Settings::default()),
             &HangingChannel,
             &mut out,
             "grpc",

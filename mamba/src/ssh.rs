@@ -12,9 +12,9 @@ use crate::channel::{BuildStream, ChannelError, ControlChannel};
 use async_trait::async_trait;
 use mamba_core::layout;
 use mamba_core::proto::artifact_request::Kind;
-use mamba_core::proto::{build_event, BuildEvent, TransferTarget};
-use std::path::Path;
+use mamba_core::proto::{BuildEvent, TransferTarget, build_event};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -355,8 +355,14 @@ mod tests {
         ssh.remember("proj-a", &["--release".to_string()], "/home/dev/a");
         ssh.remember("proj-b", &[], "/home/dev/b");
 
-        let a = ssh.request_artifact("proj-a", Kind::ProcMacros).await.unwrap();
-        let b = ssh.request_artifact("proj-b", Kind::ProcMacros).await.unwrap();
+        let a = ssh
+            .request_artifact("proj-a", Kind::ProcMacros)
+            .await
+            .unwrap();
+        let b = ssh
+            .request_artifact("proj-b", Kind::ProcMacros)
+            .await
+            .unwrap();
 
         assert_eq!(a.relative_path, "target/release/deps", "A built --release");
         assert_eq!(b.relative_path, "target/debug/deps", "B built plain debug");
